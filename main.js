@@ -1,4 +1,4 @@
-// cs2-web-game — Phase 3: Map Blockout, Weapon System, Economy
+// cs2-web-game — Phase 4: Enemy AI, Buy Menu, Improved Map
 // Three.js (rendering) + Rapier (collisions) via CDN importmap.
 //
 // Physics model:
@@ -9,10 +9,11 @@
 //   - movement                       : Source friction/accelerate on ground,
 //                                      exact Quake/Source air-accelerate in air
 //
-// Phase 3 (this file):
-//   - structured map: T Spawn -> Mid -> A Site, corridors, cover, a ramp
-//   - weapon system: Glock / MP5 / Deagle (keys 1-2-3, per-weapon ammo)
-//   - economy: $800 start, kill rewards, money HUD
+// Phase 4 (this file):
+//   - moving enemies: 5 bots with patrol/chase AI and wall colliders
+//   - buy menu: press B to buy/equip weapons (pauses game inputs)
+//   - improved map: sandy T Spawn, grey-concrete Mid, wooden A Site,
+//     extra covers, a second ramp, zone floor paints
 
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
@@ -49,11 +50,14 @@ const PLAYER = {
 // WEAPON SYSTEM
 // ================================================================
 const WEAPONS = [
-  { name: 'Glock',  damage: 26, fireRate: 170, magSize: 20, killReward: 300,  color: 0x3a4048, scale: 0.80 },
-  { name: 'MP5',    damage: 28, fireRate: 90,  magSize: 30, killReward: 600,  color: 0x2f3540, scale: 1.00 },
-  { name: 'Deagle', damage: 60, fireRate: 500, magSize: 7,  killReward: 1500, color: 0x9aa1ac, scale: 0.88 },
+  { name: 'Glock',  slot: 'PISTOL', price: 0,    damage: 26, fireRate: 170, magSize: 20, killReward: 300,  color: 0x3a4048, scale: 0.80 },
+  { name: 'MP5',    slot: 'SMG',    price: 1200, damage: 28, fireRate: 90,  magSize: 30, killReward: 600,  color: 0x2f3540, scale: 1.00 },
+  { name: 'Deagle', slot: 'PISTOL', price: 3000, damage: 60, fireRate: 500, magSize: 7,  killReward: 1500, color: 0x9aa1ac, scale: 0.88 },
 ];
 const ENEMY_HP = 100;
+
+// enemy AI tuning (Phase 4)
+const ENEMY = { patrolSpeed: 60, chaseSpeed: 120, chaseRange: 400, chaseYRange: 60 };
 
 // ================================================================
 // ECONOMY
@@ -171,15 +175,23 @@ async function boot() {
   const shootables = [];
 
   // ---------------- materials & textures ----------------
+  // zone-distinct look: sandy T Spawn, grey concrete Mid, wooden A Site
   const concreteTex = makeConcreteTexture();
   concreteTex.repeat.set(9, 10);                 // tiling over the big floor
+  const midTex = makeConcreteTexture();
+  midTex.repeat.set(2, 2);                       // tighter tiling on Mid walls
   const floorMat = new THREE.MeshStandardMaterial({ map: concreteTex, roughness: 1 });
-  const wallMat = new THREE.MeshStandardMaterial({ map: makeSandTexture(), roughness: 0.95 });
-  const crateMat = new THREE.MeshStandardMaterial({ map: makeWoodTexture(), roughness: 0.85 });
+  const midMat = new THREE.MeshStandardMaterial({ map: midTex, roughness: 1 });          // grey concrete
+  const wallMat = new THREE.MeshStandardMaterial({ map: makeSandTexture(), roughness: 0.95 });  // sandy
+  const crateMat = new THREE.MeshStandardMaterial({ map: makeWoodTexture(), roughness: 0.85 }); // wooden
 
   // ---------------- map helpers (every mesh gets a FIXED collider) -----
   const BOX = (x, y, z, w, h, d, type = 'wall') => {
-    const mat = type === 'crate' ? crateMat : type === 'concrete' ? floorMat : wallMat;
+    const mat =
+      type === 'crate'    ? crateMat :
+      type === 'mid'      ? midMat :
+      type === 'concrete' ? floorMat :
+      wallMat;
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
     mesh.position.set(x, y, z);
     mesh.castShadow = true;
@@ -240,11 +252,15 @@ async function boot() {
   BOX(-210, 48, 240, 280, 96, 16, 'wall');   // x -350..-70
   BOX(125, 48, 240, 110, 96, 16, 'wall');    // x 70..180
   BOX(305, 48, 240, 90, 96, 16, 'wall');     // x 260..350
+  // sandy spawn flanks (frame the spawn and shield the exits)
+  BOX(-140, 48, 330, 16, 96, 140, 'wall');   // west flank
+  BOX(140, 48, 330, 16, 96, 140, 'wall');    // east flank
 
-  // ---- Mid (lane x -70..70, z -90..240) ----
-  BOX(-70, 48, 75, 16, 96, 330, 'wall');     // west lane wall
-  BOX(70, 48, 75, 16, 96, 330, 'wall');      // east lane wall
-  BOX(0, 20, 40, 64, 40, 16, 'wall');        // low cover (jumpable, h40)
+  // ---- Mid (lane x -70..70, z -90..240) — grey concrete corridor ----
+  BOX(-70, 48, 75, 16, 96, 330, 'mid');      // west lane wall
+  BOX(70, 48, 75, 16, 96, 330, 'mid');       // east lane wall
+  BOX(0, 20, 40, 64, 40, 16, 'mid');         // low cover (jumpable, h40)
+  BOX(-45, 20, 150, 48, 40, 16, 'mid');      // second low cover (south)
 
   // ---- west area (x -350..-78) — extra divider for cover ----
   BOX(-220, 48, -20, 16, 96, 160, 'wall');
@@ -253,6 +269,9 @@ async function boot() {
   BOX(215, 32, -310, 250, 64, 160, 'concrete');           // platform x90..340 z-390..-230
   // ramp: floor (z=-90, y=0) up to platform top (z=-230, y=64), run 140
   RAMP(175, 21, -165, 130, 24, 154, 0.4289, 'concrete');
+  RAMP(305, 21, -165, 70, 24, 154, 0.4289, 'concrete');  // second ramp (east side)
+  BOX(215, 80, -382, 240, 32, 16, 'crate');               // wooden barricade (platform north edge)
+  BOX(70, 32, -150, 64, 64, 64, 'crate');                 // ground crate west of the ramps
 
   // ---- wooden crates (cover + boosts) ----
   BOX(-200, 32, 300, 64, 64, 64, 'crate');    // T spawn stack
@@ -265,14 +284,34 @@ async function boot() {
   BOX(150, 160, -320, 64, 64, 64, 'crate');
 
   // ---- zone markers (visual only) ----
-  MARK(0, 0.5, 320, 500, 130, 0x8a6f4a);      // T Spawn floor paint
-  MARK(215, 64.5, -310, 180, 120, 0xa8324a);  // A Site floor paint
+  MARK(0, 0.5, 320, 500, 130, 0x8a6f4a);      // T Spawn floor paint (sandy)
+  MARK(0, 0.5, 75, 120, 320, 0x565b62);       // Mid floor paint (grey)
+  MARK(215, 64.5, -310, 180, 120, 0xa8324a);  // A Site floor paint (red)
 
   // ================================================================
-  // ENEMIES — red capsule dummies, 100 HP each
+  // ENEMIES — 5 AI bots: patrol between waypoints, chase the player
+  // when close. Each bot has a dynamic capsule collider, so Rapier
+  // blocks it from walking through walls and crates.
   // ================================================================
   const enemies = [];
-  function spawnEnemy(x, y, z) {
+
+  // waypoints are [x, z]; bots stand at their spawn height (gravity
+  // keeps their feet on the floor). Every waypoint of a bot lives in
+  // one connected area, clear of crates and walls.
+  const ENEMY_SPAWNS = [
+    // 1 — Mid (grey concrete lane)
+    { x: 0, z: -40, wps: [[-45, 140], [45, 60], [0, -55], [-45, -55]] },
+    // 2 — T Spawn (sandy area, south-west corner)
+    { x: -290, z: 330, wps: [[-320, 360], [-260, 360], [-260, 270], [-320, 270]] },
+    // 3 — West yard
+    { x: -260, z: 140, wps: [[-290, 90], [-150, 90], [-150, 200], [-290, 200]] },
+    // 4 — A Site (on the platform: floor top 64 + 36)
+    { x: 270, y: 100, z: -300, wps: [[100, -260], [300, -260], [300, -345], [100, -345]] },
+    // 5 — A-short / east lane
+    { x: 240, z: 140, wps: [[150, 60], [150, 200], [240, 200], [240, 60]] },
+  ];
+
+  function spawnEnemy(x, y, z, waypoints) {
     const mesh = new THREE.Mesh(
       // radius 16 + cylinder 40 = 72 total — same hull size as the player
       new THREE.CapsuleGeometry(16, 40, 4, 14),
@@ -282,23 +321,41 @@ async function boot() {
         emissive: 0x000000,
       })
     );
-    mesh.position.set(x, y, z);                // y = floorTop + 36
-    mesh.rotation.y = Math.random() * Math.PI * 2;
+    mesh.position.set(x, y, z);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
+    scene.add(mesh);
+    enemies.push(mesh);
+    shootables.push(mesh);
+
+    // dynamic capsule body: gravity pins it to the floor and Rapier's
+    // collision solver stops it at walls/crates (no walking through)
+    const body = world.createRigidBody(
+      RAPIER.RigidBodyDesc.dynamic().setTranslation(x, y, z)
+    );
+    body.lockRotations(true);
+    world.createCollider(
+      RAPIER.ColliderDesc.capsule(PLAYER.halfHeight, PLAYER.radius)
+        .setFriction(0)
+        .setRestitution(0),
+      body
+    );
+
     mesh.userData = {
       enemy: true,
       hp: ENEMY_HP,
       flashUntil: 0,
+      body,
+      waypoints,
+      wpIndex: 0,
+      state: 'patrol',
+      checkAt: performance.now(),
+      checkX: x,
+      checkZ: z,
     };
-    scene.add(mesh);
-    enemies.push(mesh);
-    shootables.push(mesh);
     return mesh;
   }
-  spawnEnemy(0, 36, 0);                        // Mid
-  spawnEnemy(-240, 36, 120);                   // west area
-  spawnEnemy(215, 100, -320);                  // A Site (on platform: 64 + 36)
+  for (const s of ENEMY_SPAWNS) spawnEnemy(s.x, s.y || 36, s.z, s.wps);
 
   // ================================================================
   // player — DYNAMIC capsule (T Spawn, feet 5 above floor -> lands)
@@ -420,6 +477,7 @@ async function boot() {
 
   function killEnemy(mesh, weapon) {
     scene.remove(mesh);
+    world.removeRigidBody(mesh.userData.body);   // drop its collider too
     const i = enemies.indexOf(mesh);
     if (i >= 0) enemies.splice(i, 1);
     const j = shootables.indexOf(mesh);
@@ -476,6 +534,92 @@ async function boot() {
   updateAmmoHUD();
 
   // ================================================================
+  // BUY MENU (Phase 4) — press B to toggle.
+  // Opening releases the pointer lock so menu clicks are real clicks,
+  // which also pauses all game inputs (movement / shooting / wheel).
+  // ================================================================
+  let buyMenuOpen = false;
+  const owned = WEAPONS.map((_, i) => i === 0);   // start owning the Glock
+  const buyMenuEl = document.getElementById('buyMenu');
+  const buyCardsEl = document.getElementById('buyCards');
+  const buyMoneyEl = document.getElementById('buyMoney');
+
+  function refreshBuyMenu() {
+    buyMoneyEl.textContent = '$' + playerMoney;
+    for (const card of buyCardsEl.children) {
+      const i = +card.dataset.i;
+      const w = WEAPONS[i];
+      const btn = card.querySelector('.buy-btn');
+      const equipped = i === weaponIndex;
+      card.classList.toggle('equipped', equipped);
+      btn.disabled = equipped || (!owned[i] && playerMoney < w.price);
+      btn.textContent = equipped ? 'EQUIPPED'
+        : owned[i] ? 'EQUIP'
+        : 'BUY $' + w.price;
+    }
+  }
+
+  function buyWeapon(i) {
+    const w = WEAPONS[i];
+    if (i === weaponIndex) return;
+    if (!owned[i]) {
+      if (playerMoney < w.price) { playBlip(300, 0.1, 0.15); return; }   // can't afford
+      playerMoney -= w.price;                                            // deduct the money
+      owned[i] = true;
+      ammo[i] = { mag: w.magSize, reserve: w.magSize * 3 };              // fresh ammo
+    }
+    switchWeapon(i);                     // equip it
+    updateAmmoHUD();
+    refreshBuyMenu();
+    playBlip(1100, 0.06, 0.2);
+  }
+
+  function openBuyMenu() {
+    buyMenuOpen = true;
+    buyMenuEl.classList.add('open');
+    refreshBuyMenu();
+    keys.clear();
+    jumpQueued = false;
+    if (controls.isLocked) controls.unlock();   // release the mouse so the menu is clickable
+  }
+
+  function closeBuyMenu() {
+    buyMenuOpen = false;
+    buyMenuEl.classList.remove('open');
+  }
+
+  function toggleBuyMenu() {
+    if (buyMenuOpen) closeBuyMenu();
+    else if (controls.isLocked) openBuyMenu();
+  }
+
+  // build the 3 weapon cards once
+  WEAPONS.forEach((w, i) => {
+    const card = document.createElement('div');
+    card.className = 'buy-card';
+    card.dataset.i = i;
+    card.innerHTML = `
+      <div class="bc-top"><span class="bc-name">${w.name}</span><span class="bc-slot">${w.slot}</span></div>
+      <div class="bc-stats">
+        <div><b>${w.damage}</b><span>DMG</span></div>
+        <div><b>${Math.round(60000 / w.fireRate)}</b><span>RPM</span></div>
+        <div><b>${w.magSize}</b><span>MAG</span></div>
+      </div>
+      <button class="buy-btn"></button>`;
+    card.querySelector('.buy-btn').addEventListener('click', ev => {
+      ev.stopPropagation();
+      buyWeapon(i);
+    });
+    buyCardsEl.appendChild(card);
+  });
+
+  document.getElementById('buyClose').addEventListener('click', closeBuyMenu);
+  // click on the dark backdrop (not the panel) closes
+  buyMenuEl.addEventListener('click', e => {
+    if (e.target === buyMenuEl) closeBuyMenu();
+  });
+
+  // ================================================================
   // per-frame player state (movement — unchanged from Phase 1/2)
   // ================================================================
   const vel = new THREE.Vector3();
@@ -507,15 +651,24 @@ async function boot() {
   });
 
   // shooting — LEFT MOUSE, only while pointer is locked (so UI/settings
-  // clicks can never fire a bullet)
+  // clicks can never fire a bullet; the buy menu pauses this too)
   window.addEventListener('mousedown', e => {
-    if (e.button !== 0 || !controls.isLocked) return;
+    if (e.button !== 0 || !controls.isLocked || buyMenuOpen) return;
     shoot();
   });
 
   // ---------------- input (window-level: live the moment you click) ----------------
   const keys = new Set();
   window.addEventListener('keydown', e => {
+    // B toggles the buy menu — works locked AND unlocked
+    if (e.code === 'KeyB' && !e.repeat && (controls.isLocked || buyMenuOpen)) {
+      toggleBuyMenu();
+      return;
+    }
+    if (buyMenuOpen) {
+      if (e.code === 'Escape') closeBuyMenu();   // Esc closes the menu
+      return;                                    // every other game input is paused
+    }
     if (!controls.isLocked) {
       // Esc closes the settings modal when playing is paused
       if (e.code === 'Escape') settingsModal.classList.remove('open');
@@ -580,6 +733,71 @@ async function boot() {
     );
     const hit = world.castRay(ray, 0.3, true);
     return Boolean(hit);
+  }
+
+  // ================================================================
+  // ENEMY AI (Phase 4)
+  //   patrol — walk to a random waypoint of the bot's area
+  //   chase  — if the player is within ENEMY.chaseRange (and on a
+  //            similar height), slowly walk straight at the player
+  // The velocity written here goes through Rapier's solver, so walls
+  // and crates physically stop the bot (plus a stuck check: if it
+  // barely moves for 1.2 s it picks a different waypoint).
+  // ================================================================
+  function updateEnemies() {
+    const now = performance.now();
+    const pp = playerBody.translation();
+
+    for (const e of enemies) {
+      const body = e.userData.body;
+      const p = body.translation();
+      const dx = pp.x - p.x;
+      const dz = pp.z - p.z;
+      const dist = Math.hypot(dx, dz);
+
+      let vx = 0, vz = 0, speed = 0, state = 'patrol';
+
+      if (dist < ENEMY.chaseRange && Math.abs(pp.y - p.y) < ENEMY.chaseYRange) {
+        // chase: slowly walk straight at the player
+        state = 'chase';
+        speed = ENEMY.chaseSpeed;
+        if (dist > 1e-3) { vx = dx / dist; vz = dz / dist; }
+      } else {
+        // patrol: walk to a random waypoint
+        const wps = e.userData.waypoints;
+        let wp = wps[e.userData.wpIndex];
+        let wx = wp[0] - p.x, wz = wp[1] - p.z;
+        let wd = Math.hypot(wx, wz);
+        if (wd < 30) {
+          // arrived — pick a different waypoint at random
+          let n = e.userData.wpIndex;
+          while (n === e.userData.wpIndex) n = Math.floor(Math.random() * wps.length);
+          e.userData.wpIndex = n;
+          wx = wps[n][0] - p.x; wz = wps[n][1] - p.z;
+          wd = Math.hypot(wx, wz);
+        }
+        if (wd > 1e-3) { vx = wx / wd; vz = wz / wd; speed = ENEMY.patrolSpeed; }
+
+        // stuck check: barely moved in 1.2 s (bumped a wall/crate
+        // mid-path) -> skip to another waypoint
+        if (now - e.userData.checkAt > 1200) {
+          const moved = Math.hypot(p.x - e.userData.checkX, p.z - e.userData.checkZ);
+          if (moved < 15) {
+            let n = e.userData.wpIndex;
+            while (n === e.userData.wpIndex) n = Math.floor(Math.random() * wps.length);
+            e.userData.wpIndex = n;
+          }
+          e.userData.checkAt = now;
+          e.userData.checkX = p.x;
+          e.userData.checkZ = p.z;
+        }
+      }
+
+      e.userData.state = state;
+      const lv = body.linvel();
+      body.setLinvel({ x: vx * speed, y: lv.y, z: vz * speed }, true);
+      if (speed > 0) e.rotation.y = Math.atan2(vx, vz);   // face the way it walks
+    }
   }
 
   // ================================================================
@@ -727,7 +945,14 @@ async function boot() {
     if (dt <= 0) dt = 1 / 120;
 
     if (controls.isLocked) updateMovement(dt);
+    if (!buyMenuOpen) updateEnemies();   // freeze bots while the buy menu is open
     world.step();
+
+    // glue enemy meshes to their physics bodies (AI moved the bodies)
+    for (const e of enemies) {
+      const ep = e.userData.body.translation();
+      e.position.set(ep.x, ep.y, ep.z);
+    }
 
     // camera glued to the physics body (feet + eye height)
     const p = playerBody.translation();
@@ -765,9 +990,13 @@ async function boot() {
     // hitmarker (130 ms)
     hitmarkerEl.style.display = now < hitmarkerUntil ? 'block' : 'none';
 
-    // enemy hit flash
+    // enemy hit flash (red) + chase glow (dark red = it sees you)
     for (const e of enemies) {
-      e.material.emissive.setHex(now < e.userData.flashUntil ? 0x772211 : 0x000000);
+      e.material.emissive.setHex(
+        now < e.userData.flashUntil ? 0x772211 :
+        e.userData.state === 'chase' ? 0x551111 :
+        0x000000
+      );
     }
 
     renderer.render(scene, camera);
