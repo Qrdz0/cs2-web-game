@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>cs2-web-game — Phase 4</title>
+<title>cs2-web-game — Phase 5</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
@@ -250,6 +250,69 @@
     border-radius: 4px; padding: 0 6px; font-family: Consolas, monospace;
   }
 
+  /* ---------- round HUD (top center) ---------- */
+  #roundHud {
+    position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 10; display: none; align-items: center; gap: 18px;
+    background: rgba(10, 12, 16, 0.72); border: 1px solid #2a2f38;
+    border-radius: 10px; padding: 8px 22px;
+    font: 700 15px Consolas, monospace; color: #e5e5e5;
+    text-shadow: 0 0 4px rgba(0,0,0,0.9); pointer-events: none;
+  }
+  #roundHud .label { color: #8a8f98; font-size: 10px; letter-spacing: 2px; display: block; text-align: center; }
+  #roundHud .val { font-size: 19px; color: #fff; display: block; text-align: center; }
+  #roundHud #enemiesLeft { color: #ff6b6b; }
+  #roundHud .sep { width: 1px; height: 30px; background: #2a2f38; }
+
+  /* ---------- HP (bottom left) ---------- */
+  #hpBox {
+    position: fixed; left: 14px; bottom: 84px; z-index: 10;
+    display: none; pointer-events: none;
+    font: 700 20px Consolas, monospace; color: #4dff88;
+    text-shadow: 0 0 5px rgba(0,0,0,0.9);
+  }
+  #hpBox.low { color: #ff4d5e; }
+  #hpBar {
+    margin-top: 4px; width: 140px; height: 7px;
+    background: rgba(255,255,255,0.12); border-radius: 4px; overflow: hidden;
+  }
+  #hpBarFill {
+    height: 100%; width: 100%; background: #4dff88; border-radius: 4px;
+    transition: width .15s ease-out;
+  }
+  #hpBox.low #hpBarFill { background: #ff4d5e; }
+
+  /* ---------- round banner (center) ---------- */
+  #roundBanner {
+    position: fixed; top: 22%; left: 50%; transform: translateX(-50%);
+    z-index: 12; display: none; pointer-events: none;
+    font: 800 42px 'Segoe UI', system-ui, sans-serif; letter-spacing: 2px;
+    color: #fff; text-shadow: 0 2px 18px rgba(0,0,0,0.8);
+    opacity: 1; transition: opacity .5s ease-out;
+    white-space: nowrap;
+  }
+
+  /* ---------- damage flash + directional indicator ---------- */
+  #damageFlash {
+    position: fixed; inset: 0; z-index: 13; pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 40%, rgba(200, 10, 20, 0.75) 100%);
+    opacity: 0; transition: opacity .05s linear;
+  }
+  #dmgIndicators {
+    position: fixed; inset: 0; z-index: 12; pointer-events: none; overflow: hidden;
+  }
+  .dmg-arrow {
+    position: absolute; left: 50%; top: 50%;
+    width: 0; height: 0;
+    border-left: 14px solid transparent;
+    border-right: 14px solid transparent;
+    border-bottom: 22px solid rgba(255, 40, 60, 0.9);
+    filter: drop-shadow(0 0 6px rgba(255, 40, 60, 0.8));
+    /* arrow sits 110px ABOVE the crosshair; JS rotates the element
+       around the crosshair center via transform-origin */
+    transform-origin: 14px -110px;
+  }
+
   #err {
     position: fixed; inset: auto 0 0 0; z-index: 60;
     background: #3b0d0c; color: #ffb4ae; padding: 10px 16px;
@@ -275,6 +338,21 @@
 </div>
 
 <div id="hitmarker"><span></span><span></span></div>
+
+<div id="roundHud">
+  <div><span class="label">ROUND</span><span class="val" id="roundNum">—</span></div>
+  <div class="sep"></div>
+  <div><span class="label">ENEMIES</span><span class="val" id="enemiesLeft">0</span></div>
+</div>
+
+<div id="roundBanner"></div>
+<div id="damageFlash"></div>
+<div id="dmgIndicators"></div>
+
+<div id="hpBox">
+  <span id="hp">HP 100</span>
+  <div id="hpBar"><div id="hpBarFill"></div></div>
+</div>
 
 <div id="hud">
   <div><span id="speed">0</span> ups</div>
@@ -345,7 +423,7 @@
       <div class="keys">
         <b>W A S D</b> move &nbsp; <b>Space</b> jump &nbsp; <b>Mouse</b> look<br>
         <b>LMB</b> shoot &nbsp; <b>R</b> reload &nbsp; <b>1 2 3</b> switch weapon<br>
-        <b>B</b> buy menu &nbsp;·&nbsp; <b>A/D + mouse</b> air-strafe &nbsp;·&nbsp; <b>Esc</b> release mouse &nbsp;·&nbsp; <b>&#9881;</b> settings
+        <b>B</b> buy menu &nbsp;·&nbsp; kill all enemies to win the round &nbsp;·&nbsp; <b>Esc</b> release mouse &nbsp;·&nbsp; <b>&#9881;</b> settings
       </div>
     </div>
   </div>
