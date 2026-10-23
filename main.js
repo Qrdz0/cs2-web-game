@@ -54,11 +54,18 @@ const PLAYER = {
 
 // ================================================================
 // WEAPON SYSTEM
+//   kick     = view punch in radians (camera jumps up when firing)
+//   pellets  = rays per shot (Nova)
+//   spread   = pellet cone (tangent units, camera right/up offsets)
+//   zoomFov  = right-click scope FOV (AWP)
 // ================================================================
+const BASE_FOV = 90;
 const WEAPONS = [
-  { name: 'Glock',  slot: 'PISTOL', price: 0,    damage: 26, fireRate: 170, magSize: 20, killReward: 300,  scale: 0.80 },
-  { name: 'MP5',    slot: 'SMG',    price: 1200, damage: 28, fireRate: 90,  magSize: 30, killReward: 600,  scale: 1.00 },
-  { name: 'Deagle', slot: 'PISTOL', price: 3000, damage: 60, fireRate: 500, magSize: 7,  killReward: 1500, scale: 0.88 },
+  { name: 'Glock',  slot: 'PISTOL',  price: 0,    damage: 26, fireRate: 170, magSize: 20, killReward: 300,  scale: 0.80, kick: 0.016 },
+  { name: 'MP5',    slot: 'SMG',     price: 1200, damage: 28, fireRate: 90,  magSize: 30, killReward: 600,  scale: 1.00, kick: 0.013 },
+  { name: 'Deagle', slot: 'PISTOL',  price: 3000, damage: 60, fireRate: 500, magSize: 7,  killReward: 1500, scale: 0.88, kick: 0.032 },
+  { name: 'AWP',    slot: 'SNIPER',  price: 4750, damage: 130, fireRate: 1450, magSize: 5, killReward: 100,  scale: 1.15, kick: 0.050, zoomFov: 40 },
+  { name: 'Nova',   slot: 'SHOTGUN', price: 1050, damage: 17, fireRate: 850,  magSize: 8,  killReward: 900,  scale: 1.05, kick: 0.045, pellets: 5, spread: 0.09 },
 ];
 const ENEMY_HP = 100;
 
@@ -568,7 +575,38 @@ async function boot() {
     return { group: g, flash: new THREE.Vector3(0, 1.1, -13) };
   }
 
-  const VIEWS = [buildPistol(), buildSMG(), buildDeagle()];
+  // ---- AWP (sniper): long barrel, big scope, bolt handle, green body ----
+  function buildSniper() {
+    const g = new THREE.Group();
+    addBox(g, 2.6, 2.4, 16, 0, 0.6, -2, 0x37472f, 0.35, 0.65);      // green receiver
+    addBox(g, 2.2, 1.4, 8,  0, 0.3, -12, 0x1f2a1c, 0.3, 0.7);       // forend
+    addCyl(g, 0.7, 13, 0, 1.1, -17.5, 0x1a1d22);                    // long barrel (to z -24)
+    addBox(g, 1.9, 4.6, 2.6, 0, -2.6, 3.4, 0x37472f, 0.3, 0.7, 0.25); // grip
+    addBox(g, 2.4, 3.2, 6,  0, -1.2, 9, 0x23262b, 0.35, 0.65);      // stock
+    addCyl(g, 1.1, 7, 0, 3.2, -3, 0x1a1d22);                        // scope tube
+    addCyl(g, 1.45, 2.2, 0, 3.2, -7.2, 0x1a1d22);                   // objective bell
+    addCyl(g, 1.3, 1.6, 0, 3.2, 1.2, 0x1a1d22);                     // eyepiece
+    addBox(g, 0.7, 1.7, 0.9, 0, 2.0, -1, 0x2f3540, 0.6, 0.4);       // scope mount
+    addBox(g, 0.5, 0.9, 0.6, 1.7, 0.5, 0.6, 0x9aa1ac, 0.75, 0.35);  // bolt handle
+    addBox(g, 0.4, 0.8, 0.5, 0, 4.9, -8.6, 0x1a1d22);               // front sight post
+    return { group: g, flash: new THREE.Vector3(0, 1.1, -24.5) };
+  }
+
+  // ---- Nova (pump shotgun): black barrel + tube, wood forend/stock ----
+  function buildShotgun() {
+    const g = new THREE.Group();
+    addBox(g, 2.6, 2.6, 10, 0, 0.4, 0, 0x2b2f36, 0.5, 0.5);         // receiver
+    addCyl(g, 0.75, 14, 0, 1.5, -10, 0x1a1d22);                     // barrel (to z -17)
+    addCyl(g, 0.6, 10, 0, -0.6, -8, 0x2f3540);                      // tube magazine
+    addBox(g, 2.5, 1.9, 5.5, 0, 0.4, -8, 0x9a6b3f, 0.15, 0.85);     // wooden pump/forend
+    addBox(g, 2.0, 4.2, 2.6, 0, -2.6, 3.6, 0x9a6b3f, 0.15, 0.85, 0.22); // wood grip
+    addBox(g, 2.4, 3.0, 6,  0, -1.0, 9, 0x9a6b3f, 0.15, 0.85);      // wood stock
+    addBox(g, 2.7, 0.5, 3.5, 0, 2.05, -1, 0xe11d48, 0.3, 0.4);      // red accent
+    addBox(g, 0.35, 0.6, 0.4, 0, 2.6, -16.5, 0x1a1d22);             // bead sight
+    return { group: g, flash: new THREE.Vector3(0, 1.5, -17.5) };
+  }
+
+  const VIEWS = [buildPistol(), buildSMG(), buildDeagle(), buildSniper(), buildShotgun()];
   for (const v of VIEWS) {
     v.group.visible = false;
     gunRig.add(v.group);
@@ -596,6 +634,36 @@ async function boot() {
   let hitmarkerUntil = 0;
   let damageFlashUntil = 0;     // red screen flash
   const dmgIndicators = [];     // directional arrows {el, until}
+  let scoped = false;           // AWP right-click zoom state
+  let viewPunch = 0;            // current camera recoil offset (radians, + = up)
+  let viewPunchApplied = 0;     // part of viewPunch already baked into camera
+
+  // ---------------- bullet holes (decals, capped at 50) ----------------
+  const MAX_BULLET_HOLES = 50;
+  const bulletHoles = [];
+  const holeGeo = new THREE.CircleGeometry(1.7, 12);
+  const holeMat = new THREE.MeshBasicMaterial({
+    color: 0x0b0b0b,
+    polygonOffset: true,
+    polygonOffsetFactor: -4,
+    polygonOffsetUnits: -4,
+  });
+  const HOLE_NORMAL = new THREE.Vector3(0, 0, 1);
+
+  function spawnBulletHole(point, normal) {
+    const m = new THREE.Mesh(holeGeo, holeMat);
+    // lift off the surface a hair + polygonOffset => no z-fighting
+    m.position.copy(point).addScaledVector(normal, 0.15);
+    // CircleGeometry faces +Z -> rotate it flat onto the surface
+    m.quaternion.setFromUnitVectors(HOLE_NORMAL, normal);
+    scene.add(m);
+    bulletHoles.push(m);
+    // CRITICAL: never let more than MAX_BULLET_HOLES exist — drop the oldest
+    if (bulletHoles.length > MAX_BULLET_HOLES) {
+      const oldest = bulletHoles.shift();
+      scene.remove(oldest);
+    }
+  }
 
   const raycaster = new THREE.Raycaster();
   const SCREEN_CENTER = new THREE.Vector2(0, 0);
@@ -647,6 +715,7 @@ async function boot() {
 
   function switchWeapon(i) {
     if (i < 0 || i >= WEAPONS.length || i === weaponIndex) return;
+    if (scoped) setScoped(false);   // leaving the AWP drops the scope
     weaponIndex = i;
     VIEWS.forEach((v, idx) => { v.group.visible = idx === i; });
     updateAmmoHUD();
@@ -695,10 +764,24 @@ async function boot() {
     }
     a.mag--;
 
+    // --- rays: 1 for normal weapons, N spread rays for the Nova ---
+    const pellets = w.pellets || 1;
+    const spread = w.spread || 0;
     raycaster.setFromCamera(SCREEN_CENTER, camera);
-    const hits = raycaster.intersectObjects(shootables, false);
+    const baseDir = raycaster.ray.direction.clone();
+    const camRight = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
+    const camUp = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1);
 
-    if (hits.length > 0) {
+    for (let i = 0; i < pellets; i++) {
+      if (pellets > 1) {
+        const d = baseDir.clone()
+          .addScaledVector(camRight, (Math.random() * 2 - 1) * spread)
+          .addScaledVector(camUp, (Math.random() * 2 - 1) * spread)
+          .normalize();
+        raycaster.ray.direction.copy(d);
+      }
+      const hits = raycaster.intersectObjects(shootables, false);
+      if (hits.length === 0) continue;
       const hit = hits[0];
       if (hit.object.userData.enemy) {
         const e = hit.object;
@@ -707,12 +790,20 @@ async function boot() {
         hitmarkerUntil = now + 130;
         playBlip(1200, 0.05, 0.22);
         if (e.userData.hp <= 0) killEnemy(e, w);
+      } else if (hit.face) {
+        // wall / ground / crate -> bullet hole, oriented to the surface
+        const normal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+        spawnBulletHole(hit.point, normal);
       }
     }
 
     updateAmmoHUD();
 
-    recoil = 1;
+    // --- gun kick (backward + up, smoothed back in frame()) ---
+    recoil = Math.min(1.8, recoil + w.kick * 55);
+    // --- view punch (camera jumps up, recovers smoothly in frame()) ---
+    viewPunch = Math.min(0.06, viewPunch + w.kick);
+
     flashUntil = now + 45;
     muzzleLight.intensity = 50;
     playShotSound();
@@ -915,6 +1006,35 @@ async function boot() {
   const resumeEl = document.getElementById('resume');
   const settingsBtn = document.getElementById('settingsBtn');
   const settingsModal = document.getElementById('settingsModal');
+  const scopeEl = document.getElementById('scope');
+  const crosshairEl = document.getElementById('crosshair');
+
+  // ---------------- AWP SCOPE (right-click) ----------------
+  function setScoped(on) {
+    const w = WEAPONS[weaponIndex];
+    scoped = Boolean(on) && Boolean(w.zoomFov);
+    camera.fov = scoped ? w.zoomFov : BASE_FOV;
+    camera.updateProjectionMatrix();
+    scopeEl.style.display = scoped ? 'block' : 'none';
+    if (controls.isLocked) crosshairEl.style.display = scoped ? 'none' : 'block';
+    gunRig.visible = controls.isLocked && !scoped;
+  }
+
+  function toggleZoom() {
+    const w = WEAPONS[weaponIndex];
+    if (!w.zoomFov) return;   // only the AWP can zoom
+    setScoped(!scoped);
+    playBlip(scoped ? 700 : 500, 0.04, 0.12);
+  }
+
+  // keep the camera punch tracking consistent no matter what
+  function applyViewPunch() {
+    const delta = viewPunch - viewPunchApplied;
+    if (delta !== 0) {
+      camera.rotation.x += delta;
+      viewPunchApplied += delta;
+    }
+  }
 
   // ---------------- TEAM SELECT ----------------
   function joinTeam(team) {
@@ -956,14 +1076,15 @@ async function boot() {
   controls.addEventListener('lock', () => {
     overlay.style.display = 'none';
     settingsBtn.style.display = 'none';
-    document.getElementById('crosshair').style.display = 'block';
+    crosshairEl.style.display = scoped ? 'none' : 'block';
     document.getElementById('hud').style.display = 'block';
     document.getElementById('roundHud').style.display = 'flex';
     document.getElementById('hpBox').style.display = 'block';
     ammoEl.style.display = 'block';
-    gunRig.visible = true;
+    gunRig.visible = !scoped;
   });
   controls.addEventListener('unlock', () => {
+    if (scoped) setScoped(false);
     overlay.style.display = 'flex';
     settingsBtn.style.display = 'flex';
     loadingEl.style.display = 'none';
@@ -980,9 +1101,11 @@ async function boot() {
   });
 
   window.addEventListener('mousedown', e => {
-    if (e.button !== 0 || !controls.isLocked || buyMenuOpen) return;
-    shoot();
+    if (!controls.isLocked || buyMenuOpen) return;
+    if (e.button === 0) shoot();
+    else if (e.button === 2) toggleZoom();   // AWP scope
   });
+  window.addEventListener('contextmenu', e => e.preventDefault());
 
   // ---------------- input ----------------
   const keys = new Set();
@@ -1003,6 +1126,8 @@ async function boot() {
     if (e.code === 'Digit1') switchWeapon(0);
     if (e.code === 'Digit2') switchWeapon(1);
     if (e.code === 'Digit3') switchWeapon(2);
+    if (e.code === 'Digit4') switchWeapon(3);
+    if (e.code === 'Digit5') switchWeapon(4);
     if (e.code === 'KeyR' && !e.repeat) reload();
     if (e.code === 'Space') {
       e.preventDefault();
@@ -1380,10 +1505,17 @@ async function boot() {
         isGrounded ? '(ground)' : '(air)', 'state:', ROUND.state);
     }
 
-    // recoil
-    if (recoil > 0) recoil = Math.max(0, recoil - dt * 7);
-    gunRig.position.z = GUN_BASE.z + recoil * 3;
-    gunRig.rotation.x = recoil * 0.12;
+    // ---- gun kick: backward + up, smooth lerp back to rest ----
+    recoil += (0 - recoil) * Math.min(1, dt * 11);
+    if (recoil < 0.001) recoil = 0;
+    gunRig.position.z = GUN_BASE.z + recoil * 3;      // kicks backward
+    gunRig.position.y = GUN_BASE.y + recoil * 1.2;    // and slightly up
+    gunRig.rotation.x = recoil * 0.13;
+
+    // ---- view punch: camera jumped up on fire, recover smoothly ----
+    viewPunch += (0 - viewPunch) * Math.min(1, dt * 9);
+    if (Math.abs(viewPunch) < 1e-5) viewPunch = 0;
+    applyViewPunch();
 
     // muzzle flash
     muzzleLight.intensity = Math.max(0, muzzleLight.intensity - dt * 600);
