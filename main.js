@@ -1,4 +1,4 @@
-// cs2-web-game — Phase 1: Mirage Map, Team Select, AI Fix
+// cs2-web-game — Phase 3: Grenades + Bomb Defusal
 // Three.js (rendering) + Rapier (collisions) via CDN importmap.
 //
 // Physics model (unchanged):
@@ -450,6 +450,14 @@ async function boot() {
       nextShotAt: performance.now() + 800 + Math.random() * 900,
       losAt: 0,
       hasLOS: false,
+      route: null,
+      routeIdx: 0,
+      stuckAt: 0,
+      stuckX: x,
+      stuckZ: z,
+      stuckN: 0,
+      plantProg: 0,
+      defuseProg: 0,
     };
     return mesh;
   }
@@ -623,6 +631,45 @@ async function boot() {
   const muzzleLight = new THREE.PointLight(0xffcc88, 0, 80, 2);
   gunRig.add(muzzleLight);
 
+  // ---- grenade viewmodels (key 6 = smoke, key 7 = flashbang) ----
+  function buildSmokeNade() {
+    const g = new THREE.Group();
+    addCyl(g, 1.5, 6, 0, 0, -3, 0x2f6b3a, 0.3, 0.7);            // green canister
+    addCyl(g, 1.7, 1.2, 0, 0, -6.2, 0x1f4a28, 0.3, 0.7);         // bottom ring
+    addBox(g, 0.9, 1.1, 1.4, 0, 1.6, -1, 0x9aa1ac, 0.7, 0.35);   // spoon lever
+    addBox(g, 0.5, 1.2, 0.5, 0, 1.5, 0.4, 0xd94f4f, 0.2, 0.6);   // pull ring
+    return { group: g, flash: new THREE.Vector3(0, 0, -7) };
+  }
+  function buildFlashNade() {
+    const g = new THREE.Group();
+    addCyl(g, 1.4, 5.5, 0, 0, -2.5, 0x8a8f96, 0.7, 0.35);        // grey body
+    addCyl(g, 1.6, 1.1, 0, 0, -5.4, 0x5f646b, 0.7, 0.35);
+    addBox(g, 0.9, 1.0, 1.3, 0, 1.5, -0.8, 0x9aa1ac, 0.7, 0.35);
+    addBox(g, 0.5, 1.2, 0.5, 0, 1.4, 0.5, 0xe11d48, 0.2, 0.6);
+    return { group: g, flash: new THREE.Vector3(0, 0, -6) };
+  }
+  const NADE_VIEWS = { smoke: buildSmokeNade(), flash: buildFlashNade() };
+  for (const k in NADE_VIEWS) {
+    NADE_VIEWS[k].group.visible = false;
+    gunRig.add(NADE_VIEWS[k].group);
+  }
+
+  // ---- C4 bomb model (tan block + blinking red light) ----
+  const c4Mesh = new THREE.Group();
+  c4Mesh.add(new THREE.Mesh(
+    new THREE.BoxGeometry(14, 6, 10),
+    new THREE.MeshStandardMaterial({ color: 0xb08d57, roughness: 0.75 })
+  ));
+  const c4Light = new THREE.Mesh(
+    new THREE.SphereGeometry(1.6, 8, 8),
+    new THREE.MeshBasicMaterial({ color: 0xff2020 })
+  );
+  c4Light.position.set(4, 3.2, 3);
+  c4Mesh.add(c4Light);
+  c4Mesh.userData.light = c4Light;
+  c4Mesh.visible = false;
+  scene.add(c4Mesh);
+
   // ================================================================
   // COMBAT + HUD STATE
   // ================================================================
@@ -637,6 +684,58 @@ async function boot() {
   let scoped = false;           // AWP right-click zoom state
   let viewPunch = 0;            // current camera recoil offset (radians, + = up)
   let viewPunchApplied = 0;     // part of viewPunch already baked into camera
+
+  // ---------------- Phase 3: grenade state ----------------
+  let grenadeMode = null;       // 'smoke' | 'flash' | null
+  let lastNadeAt = 0;
+  let lastGunIndex = 0;
+  const projectiles = [];       // thrown grenades {mesh, body, kind, thrownAt, slowSince}
+  const smokes = [];            // active smoke clouds {mesh, mat, until}
+  let flashOverlayUntil = 0;    // white flashbang overlay fade end
+
+  // ---------------- Phase 3: bomb state ----------------
+  const BOMB_TIMER = 40000;     // 40s from plant to explosion
+  const PLANT_TIME = 3000;      // hold E for 3s to plant
+  const DEFUSE_TIME = 5000;     // hold E for 5s to defuse
+  const bomb = { planted: false, plantedAt: 0, x: 0, y: 0, z: 0, site: null };
+  let bombCarrier = null;       // enemy mesh carrying C4 (when player is CT)
+  let plantProgress = 0;
+  let defuseProgress = 0;
+
+  // plant zones (XZ rect + capsule-center Y range)
+  const PLANT_ZONES = [
+    { site: 'A', x1: 250, x2: 400, z1: -175, z2: -70, y1: 50, y2: 180 },   // A platform
+    { site: 'A', x1: 250, x2: 295, z1: -290, z2: -175, y1: 50, y2: 180 },  // A platform (palace side)
+    { site: 'B', x1: -340, x2: -120, z1: -160, z2: -40, y1: 15, y2: 140 }, // B site
+  ];
+
+  // straight-line waypoint routes ("bots can't pathfind" — stuck-skip + teleport safety)
+  const CARRIER_ROUTES = {
+    A: {
+      south: [[60, 250], [60, 170], [54, 60], [54, -110], [95, -120], [130, -150], [255, -150], [285, -130]],
+      east: [[240, -30], [110, -45], [110, -150], [255, -150], [285, -130]],
+      mid: [[54, 100], [54, -110], [95, -120], [130, -150], [255, -150], [285, -130]],
+      west: [[-60, 250], [-60, 180], [0, 140], [54, 100], [54, -110], [95, -120], [130, -150], [255, -150], [285, -130]],
+    },
+    B: {
+      south: [[-60, 250], [-60, 170], [-54, 60], [-54, -110], [-95, -120], [-150, -110], [-245, -90]],
+      west: [[-300, 100], [-240, 0], [-205, -60], [-205, -100], [-245, -90]],
+      east: [[-130, 0], [-130, -100], [-150, -110], [-205, -100], [-245, -90]],
+      mid: [[-54, 100], [-54, -110], [-95, -120], [-150, -110], [-245, -90]],
+    },
+  };
+  const CT_ROUTES = {
+    A: [[0, -340], [0, -300], [0, -260], [0, -200], [40, -130], [95, -120], [130, -150], [255, -150], [285, -130]],
+    B: [[0, -340], [0, -300], [0, -260], [0, -200], [-40, -130], [-95, -120], [-150, -110], [-205, -100]],
+  };
+
+  function carrierRoute(cp, site) {
+    const r = CARRIER_ROUTES[site];
+    if (cp.z > 140) return r.south;
+    if (cp.x > 150) return r.east;
+    if (cp.x < -150) return r.west;
+    return r.mid;
+  }
 
   // ---------------- bullet holes (decals, capped at 50) ----------------
   const MAX_BULLET_HOLES = 50;
@@ -682,6 +781,11 @@ async function boot() {
   const damageFlashEl = document.getElementById('damageFlash');
   const dmgIndicatorsEl = document.getElementById('dmgIndicators');
   const teamLabelEl = document.getElementById('teamLabel');
+  const bombLabelEl = document.getElementById('bombLabel');
+  const bombBarEl = document.getElementById('bombBar');
+  const bombBarLabelEl = document.getElementById('bombBarLabel');
+  const bombBarFillEl = document.getElementById('bombBarFill');
+  const flashOverlayEl = document.getElementById('flashOverlay');
 
   function updateAmmoHUD() {
     const w = WEAPONS[weaponIndex];
@@ -704,6 +808,20 @@ async function boot() {
     enemiesEl.textContent = enemies.length;
   }
 
+  function updateBombHUD() {
+    if (!bombLabelEl) return;
+    if (bomb.planted) {
+      const left = Math.max(0, BOMB_TIMER - (performance.now() - bomb.plantedAt));
+      const sec = Math.ceil(left / 1000);
+      bombLabelEl.textContent = 'PLANTED ' + Math.floor(sec / 60) + ':' +
+        String(sec % 60).padStart(2, '0');
+      bombLabelEl.classList.add('planted');
+    } else {
+      bombLabelEl.textContent = 'NOT PLANTED';
+      bombLabelEl.classList.remove('planted');
+    }
+  }
+
   let bannerUntil = 0;
   function showBanner(text, ms, color) {
     bannerEl.textContent = text;
@@ -714,8 +832,13 @@ async function boot() {
   }
 
   function switchWeapon(i) {
-    if (i < 0 || i >= WEAPONS.length || i === weaponIndex) return;
+    if (i < 0 || i >= WEAPONS.length) return;
+    const nadeActive = grenadeMode !== null;
+    if (i === weaponIndex && !nadeActive) return;
     if (scoped) setScoped(false);   // leaving the AWP drops the scope
+    grenadeMode = null;             // switching to a gun stows the grenade
+    NADE_VIEWS.smoke.group.visible = false;
+    NADE_VIEWS.flash.group.visible = false;
     weaponIndex = i;
     VIEWS.forEach((v, idx) => { v.group.visible = idx === i; });
     updateAmmoHUD();
@@ -747,8 +870,28 @@ async function boot() {
     console.log('[combat] killed with', weapon.name, '-> +$' + weapon.killReward,
                 '(total $' + playerMoney + ')');
 
-    // round won: every enemy down
-    if (enemies.length === 0 && ROUND.state === 'active') endRound(true);
+    // if the bomb carrier dies, another T bot picks the bomb up
+    if (mesh === bombCarrier) {
+      bombCarrier = null;
+      if (c4Mesh.parent) c4Mesh.parent.remove(c4Mesh);
+      c4Mesh.visible = false;
+      if (!bomb.planted && enemies.length > 0) {
+        bombCarrier = enemies[0];
+        bombCarrier.add(c4Mesh);
+        c4Mesh.position.set(0, 18, -14);
+        c4Mesh.rotation.set(0, Math.PI, 0);
+        c4Mesh.visible = true;
+      }
+    }
+
+    // round won: every enemy down (a planted bomb still needs defusing)
+    if (enemies.length === 0 && ROUND.state === 'active') {
+      if (bomb.planted && playerTeam === 'CT') {
+        // all Ts dead but the bomb is ticking — player must defuse it
+      } else {
+        endRound(true);
+      }
+    }
   }
 
   function shoot() {
@@ -780,7 +923,9 @@ async function boot() {
           .normalize();
         raycaster.ray.direction.copy(d);
       }
-      const hits = raycaster.intersectObjects(shootables, false);
+      // bullets pass through smoke clouds (CS-style), but not walls
+      const hits = raycaster.intersectObjects(shootables, false)
+        .filter(h => !h.object.userData.smoke);
       if (hits.length === 0) continue;
       const hit = hits[0];
       if (hit.object.userData.enemy) {
@@ -807,6 +952,309 @@ async function boot() {
     flashUntil = now + 45;
     muzzleLight.intensity = 50;
     playShotSound();
+  }
+
+  // ================================================================
+  // PHASE 3 — GRENADES (Smoke / Flashbang)
+  // ================================================================
+  function selectNade(mode) {
+    if (grenadeMode === mode) return;
+    if (scoped) setScoped(false);
+    if (grenadeMode === null) lastGunIndex = weaponIndex;
+    grenadeMode = mode;
+    VIEWS.forEach(v => { v.group.visible = false; });
+    NADE_VIEWS.smoke.group.visible = mode === 'smoke';
+    NADE_VIEWS.flash.group.visible = mode === 'flash';
+    weaponNameEl.textContent = mode === 'smoke' ? 'SMOKE' : 'FLASHBANG';
+    playBlip(620, 0.05, 0.15);
+  }
+
+  function throwGrenade() {
+    if (!grenadeMode) return;
+    const now = performance.now();
+    if (now - lastNadeAt < 900) return;   // throw cooldown
+    lastNadeAt = now;
+    const kind = grenadeMode;
+
+    raycaster.setFromCamera(SCREEN_CENTER, camera);
+    const dir = raycaster.ray.direction.clone();
+    const origin = camera.position.clone().addScaledVector(dir, 24);
+    origin.y -= 4;
+
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(4, 10, 10),
+      new THREE.MeshStandardMaterial({
+        color: kind === 'smoke' ? 0x2f6b3a : 0x8a8f96,
+        roughness: 0.6,
+      })
+    );
+    mesh.position.copy(origin);
+    mesh.castShadow = true;
+    scene.add(mesh);
+
+    const body = world.createRigidBody(
+      RAPIER.RigidBodyDesc.dynamic().setTranslation(origin.x, origin.y, origin.z)
+    );
+    world.createCollider(
+      RAPIER.ColliderDesc.ball(4).setRestitution(0.35).setFriction(0.7),
+      body
+    );
+    body.setLinvel({ x: dir.x * 480, y: dir.y * 480 + 40, z: dir.z * 480 }, true);
+
+    projectiles.push({ mesh, body, kind, thrownAt: now, slowSince: 0 });
+    playShotSound(0.3);
+
+    // auto-switch back to the primary gun
+    grenadeMode = null;
+    NADE_VIEWS.smoke.group.visible = false;
+    NADE_VIEWS.flash.group.visible = false;
+    weaponIndex = lastGunIndex;
+    VIEWS.forEach((v, idx) => { v.group.visible = idx === weaponIndex; });
+    updateAmmoHUD();
+  }
+
+  function detonateProjectile(p, i) {
+    const t = p.body.translation();
+    world.removeRigidBody(p.body);
+    scene.remove(p.mesh);
+    p.mesh.geometry.dispose();
+    p.mesh.material.dispose();
+    projectiles.splice(i, 1);
+
+    if (p.kind === 'smoke') {
+      spawnSmoke(t.x, t.y, t.z);
+      playBlip(170, 0.3, 0.22);
+    } else {
+      spawnFlash(t.x, t.y, t.z);
+      playBlip(1500, 0.35, 0.3);
+    }
+  }
+
+  function updateGrenades(dt, now) {
+    // projectiles: detonate after landing (slow for 350ms) or 5s fuse
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+      const p = projectiles[i];
+      const t = p.body.translation();
+      p.mesh.position.set(t.x, t.y, t.z);
+      p.mesh.rotation.x += dt * 7;
+
+      const lv = p.body.linvel();
+      const spd = Math.hypot(lv.x, lv.y, lv.z);
+      const expired = now - p.thrownAt > 5000;
+      if (spd < 25) {
+        if (!p.slowSince) p.slowSince = now;
+        if (expired || now - p.slowSince > 350) detonateProjectile(p, i);
+      } else {
+        p.slowSince = 0;
+        if (expired) detonateProjectile(p, i);
+      }
+    }
+
+    // smoke cloud lifetimes (15s, fade out in the last 2s)
+    for (let i = smokes.length - 1; i >= 0; i--) {
+      const s = smokes[i];
+      const left = s.until - now;
+      if (left <= 0) { removeSmoke(i); continue; }
+      if (left < 2000) s.mat.opacity = 0.85 * (left / 2000);
+    }
+  }
+
+  function spawnSmoke(x, y, z) {
+    if (smokes.length >= 4) removeSmoke(0);   // cap active smokes
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0xb9bcbe,
+      transparent: true,
+      opacity: 0.85,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(90, 18, 14), mat);
+    mesh.position.set(x, y + 70, z);
+    mesh.userData.smoke = true;
+    scene.add(mesh);
+    shootables.push(mesh);   // blocks enemy line-of-sight for 15s
+    smokes.push({ mesh, mat, until: performance.now() + 15000 });
+  }
+
+  function removeSmoke(i) {
+    const s = smokes[i];
+    scene.remove(s.mesh);
+    const j = shootables.indexOf(s.mesh);
+    if (j >= 0) shootables.splice(j, 1);
+    s.mesh.geometry.dispose();
+    s.mat.dispose();
+    smokes.splice(i, 1);
+  }
+
+  function spawnFlash(x, y, z) {
+    const t = playerBody.translation();
+    const eye = new THREE.Vector3(t.x, t.y - CAPSULE_HALF + PLAYER.eyeHeight, t.z);
+    const to = new THREE.Vector3(x, y, z).sub(eye);
+    const dist = to.length();
+    if (dist > 900) return;              // too far to be blinded
+    if (dist > 1) {
+      to.normalize();
+      // walls block the flash
+      losRaycaster.set(eye, to);
+      losRaycaster.far = dist;
+      const wallsOnly = shootables.filter(o => !o.userData.enemy && !o.userData.smoke);
+      if (losRaycaster.intersectObjects(wallsOnly, false).length > 0) return;
+    }
+    const fwd = camera.getWorldDirection(new THREE.Vector3());
+    // blinded only when roughly facing the detonation (~60 deg cone)
+    if (dist < 1 || fwd.dot(to) > 0.5) {
+      flashOverlayUntil = performance.now() + 3000;
+    }
+  }
+
+  function clearGrenades() {
+    for (const p of projectiles) {
+      world.removeRigidBody(p.body);
+      scene.remove(p.mesh);
+      p.mesh.geometry.dispose();
+      p.mesh.material.dispose();
+    }
+    projectiles.length = 0;
+    while (smokes.length) removeSmoke(0);
+    flashOverlayUntil = 0;
+    if (flashOverlayEl) flashOverlayEl.style.opacity = '0';
+    grenadeMode = null;
+    lastNadeAt = 0;
+    NADE_VIEWS.smoke.group.visible = false;
+    NADE_VIEWS.flash.group.visible = false;
+    VIEWS.forEach((v, idx) => { v.group.visible = idx === weaponIndex; });
+  }
+
+  // ================================================================
+  // PHASE 3 — BOMB DEFUSAL
+  // ================================================================
+  function zoneAt(x, y, z) {
+    for (const zn of PLANT_ZONES) {
+      if (x >= zn.x1 && x <= zn.x2 && z >= zn.z1 && z <= zn.z2 &&
+          y >= zn.y1 && y <= zn.y2) return zn;
+    }
+    return null;
+  }
+
+  // straight-line walkability test (walls/crates block it; smoke does not)
+  function clearPathTo(fx, fy, fz, tx, ty, tz) {
+    const from = new THREE.Vector3(fx, fy, fz);
+    const dir = new THREE.Vector3(tx, ty, tz).sub(from);
+    const dist = dir.length();
+    if (dist <= 10) return true;
+    dir.normalize();
+    losRaycaster.set(from, dir);
+    losRaycaster.far = dist - 8;
+    const worldOnly = shootables.filter(o => !o.userData.enemy && !o.userData.smoke);
+    return losRaycaster.intersectObjects(worldOnly, false).length === 0;
+  }
+
+  function plantBomb(x, y, z, site) {
+    if (bomb.planted) return;
+    bomb.planted = true;
+    bomb.plantedAt = performance.now();
+    bomb.x = x; bomb.y = y; bomb.z = z;
+    bomb.site = site;
+    bombCarrier = null;
+    if (c4Mesh.parent) c4Mesh.parent.remove(c4Mesh);
+    scene.add(c4Mesh);
+    c4Mesh.position.set(x, y + 7, z);
+    c4Mesh.rotation.set(0, 0, 0);
+    c4Mesh.visible = true;
+    showBanner('BOMB PLANTED', 1500, '#ff4d5e');
+    playBlip(440, 0.15, 0.25);
+
+    // CT bots rush the bomb site to defuse
+    if (playerTeam === 'T') {
+      const route = bomb.site === 'A' ? CT_ROUTES.A : CT_ROUTES.B;
+      for (const e of enemies) {
+        const ep = e.userData.body.translation();
+        e.userData.route = route;
+        e.userData.routeIdx = 0;
+        e.userData.stuckAt = 0;
+        e.userData.stuckX = ep.x;
+        e.userData.stuckZ = ep.z;
+        e.userData.stuckN = 0;
+        e.userData.defuseProg = 0;
+      }
+    }
+  }
+
+  function resetBomb() {
+    bomb.planted = false;
+    bomb.plantedAt = 0;
+    bomb.site = null;
+    bomb.x = 0; bomb.y = 0; bomb.z = 0;
+    bombCarrier = null;
+    plantProgress = 0;
+    defuseProgress = 0;
+    if (c4Mesh.parent) c4Mesh.parent.remove(c4Mesh);
+    c4Mesh.visible = false;
+    if (bombBarEl) bombBarEl.style.display = 'none';
+
+    // player is CT -> a T bot picks up the bomb and carries it to a site
+    if (playerTeam === 'CT' && enemies.length > 0) {
+      bombCarrier = enemies[0];
+      const cp = bombCarrier.userData.body.translation();
+      const site = cp.x > 150 ? 'A' : cp.x < -150 ? 'B' : (Math.random() < 0.5 ? 'A' : 'B');
+      bombCarrier.userData.targetSite = site;
+      bombCarrier.userData.route = carrierRoute(cp, site);
+      bombCarrier.userData.routeIdx = 0;
+      bombCarrier.userData.stuckAt = 0;
+      bombCarrier.userData.stuckX = cp.x;
+      bombCarrier.userData.stuckZ = cp.z;
+      bombCarrier.userData.stuckN = 0;
+      bombCarrier.add(c4Mesh);
+      c4Mesh.position.set(0, 18, -14);
+      c4Mesh.rotation.set(0, Math.PI, 0);
+      c4Mesh.visible = true;
+    }
+    updateBombHUD();
+  }
+
+  // follow e.userData.route with waypoint advance + stuck teleport safety
+  function navRoute(e, p, spd, now) {
+    const u = e.userData;
+    const route = u.route;
+    if (!route || u.routeIdx >= route.length) return { vx: 0, vz: 0, speed: 0, done: true };
+
+    if (!u.stuckAt) u.stuckAt = now;   // don't judge movement before the first step
+    if (now - u.stuckAt > 2000) {
+      const moved = Math.hypot(p.x - u.stuckX, p.z - u.stuckZ);
+      if (moved < 15) {
+        if (u.routeIdx < route.length - 1) {
+          u.routeIdx++;
+        } else {
+          u.stuckN = (u.stuckN || 0) + 1;
+          if (u.stuckN >= 3) {
+            // hard-stuck at the final waypoint: snap onto it (A route ends on platform)
+            const wp = route[route.length - 1];
+            const ty = (wp[0] >= 240 && wp[1] >= -300 && wp[1] <= -60) ? 100 : 36;
+            u.body.setTranslation({ x: wp[0], y: ty, z: wp[1] }, true);
+            u.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+            u.stuckN = 0;
+          }
+        }
+      } else {
+        u.stuckN = 0;
+      }
+      u.stuckAt = now;
+      u.stuckX = p.x;
+      u.stuckZ = p.z;
+    }
+
+    const wp = route[u.routeIdx];
+    const dx = wp[0] - p.x, dz = wp[1] - p.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 28) {
+      if (u.routeIdx < route.length - 1) {
+        u.routeIdx++;
+        return navRoute(e, p, spd, now);
+      }
+      return { vx: 0, vz: 0, speed: 0, done: true };
+    }
+    e.rotation.y = Math.atan2(dx, dz);
+    return { vx: dx / d, vz: dz / d, speed: spd, done: false };
   }
 
   // apply starting weapon
@@ -864,18 +1312,26 @@ async function boot() {
     if (ROUND.state !== 'active') return;
     ROUND.state = 'roundover';
     ROUND.stateAt = performance.now();
-    ROUND.nextAt = ROUND.stateAt + 3000;
+    ROUND.nextAt = ROUND.stateAt + 5000;   // 5s win banner, then reset
+
+    const winner = won ? playerTeam : (playerTeam === 'T' ? 'CT' : 'T');
+    const banner = winner === 'T' ? 'TERRORISTS WIN' : 'COUNTER-TERRORISTS WIN';
+
+    // freeze every bot in place during the round-over banner
+    for (const e of enemies) {
+      e.userData.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    }
+
     if (won) {
       playerMoney += 1000;
       updateAmmoHUD();
-      showBanner('ROUND ' + ROUND.number + ' WON   +$1000', 2600, '#4dff88');
       playBlip(660, 0.15, 0.2);
       delay(() => playBlip(880, 0.2, 0.2), 160);
     } else {
-      showBanner('ROUND ' + ROUND.number + ' LOST', 2600, '#ff4d5e');
       playBlip(200, 0.3, 0.22);
-      clearEnemies();   // clean up remaining bots on a loss
     }
+    showBanner(banner, 4600, won ? '#4dff88' : '#ff4d5e');
+    keys.clear();
     updateRoundHUD();
   }
 
@@ -885,6 +1341,8 @@ async function boot() {
     ROUND.stateAt = performance.now();
     respawnPlayer();
     spawnRoundEnemies();
+    clearGrenades();
+    resetBomb();
     updateRoundHUD();
     showBanner('ROUND ' + n, 1400, '#fff');
     playBlip(520, 0.1, 0.18);
@@ -1021,6 +1479,7 @@ async function boot() {
   }
 
   function toggleZoom() {
+    if (grenadeMode) return;  // no scope while holding a grenade
     const w = WEAPONS[weaponIndex];
     if (!w.zoomFov) return;   // only the AWP can zoom
     setScoped(!scoped);
@@ -1102,8 +1561,12 @@ async function boot() {
 
   window.addEventListener('mousedown', e => {
     if (!controls.isLocked || buyMenuOpen) return;
-    if (e.button === 0) shoot();
-    else if (e.button === 2) toggleZoom();   // AWP scope
+    if (e.button === 0) {
+      if (grenadeMode) throwGrenade();
+      else shoot();
+    } else if (e.button === 2) {
+      toggleZoom();   // AWP scope
+    }
   });
   window.addEventListener('contextmenu', e => e.preventDefault());
 
@@ -1128,6 +1591,8 @@ async function boot() {
     if (e.code === 'Digit3') switchWeapon(2);
     if (e.code === 'Digit4') switchWeapon(3);
     if (e.code === 'Digit5') switchWeapon(4);
+    if (e.code === 'Digit6') selectNade('smoke');
+    if (e.code === 'Digit7') selectNade('flash');
     if (e.code === 'KeyR' && !e.repeat) reload();
     if (e.code === 'Space') {
       e.preventDefault();
@@ -1298,10 +1763,11 @@ async function boot() {
   //   chase  — move at the player with random A/D strafing
   //   attack — in LOS + range: stop, face the player, fire red bolts
   // ================================================================
-  function updateEnemies(now) {
+  function updateEnemies(now, dt) {
     const pp = playerBody.translation();
 
     for (const e of enemies) {
+      if (ROUND.state !== 'active') return;
       const body = e.userData.body;
       const p = body.translation();
       const dx = pp.x - p.x;
@@ -1316,16 +1782,79 @@ async function boot() {
 
       let vx = 0, vz = 0, speed = 0, state = 'patrol';
       const sameHeight = Math.abs(pp.y - p.y) < ENEMY.chaseYRange;
+      const enemyIsCT = playerTeam === 'T';                       // enemies are the opposite team
+      const isDefuser = bomb.planted && enemyIsCT;                // CT bots rush the bomb
+      const isPlanter = !bomb.planted && !enemyIsCT && e === bombCarrier; // T bot carries the bomb
 
       if (e.userData.hasLOS && dist < ENEMY.shootRange && sameHeight) {
         // ---- ATTACK: stop, face player, shoot on cooldown ----
         state = 'attack';
+        e.userData.stuckN = 0;
         if (dist > 1) { vx = dx / dist; vz = dz / dist; }   // facing only
         e.rotation.y = Math.atan2(dx, dz);
 
         if (now >= e.userData.nextShotAt) {
           e.userData.nextShotAt = now + 900 + Math.random() * 700;
           fireEnemyShot(p);
+        }
+      } else if (isDefuser) {
+        // ---- RUSH THE BOMB, THEN DEFUSE IT (hold 5s) ----
+        state = 'defuse';
+        const bx = bomb.x - p.x;
+        const bz = bomb.z - p.z;
+        const bd = Math.hypot(bx, bz);
+        const feet = p.y - CAPSULE_HALF;
+        if (bd < 40 && Math.abs(feet - bomb.y) < 40) {
+          e.rotation.y = Math.atan2(bx, bz);
+          e.userData.defuseProg = (e.userData.defuseProg || 0) + dt;
+          if (e.userData.defuseProg >= 5) {
+            e.userData.defuseProg = 0;
+            endRound(false);   // CTs defused -> the T player loses
+            return;
+          }
+        } else {
+          e.userData.defuseProg = 0;
+          const route = e.userData.route;
+          const clear = clearPathTo(p.x, p.y + 20, p.z, bomb.x, bomb.y + 8, bomb.z);
+          if (!clear && route && e.userData.routeIdx < route.length) {
+            const nav = navRoute(e, p, ENEMY.chaseSpeed, now);
+            vx = nav.vx; vz = nav.vz; speed = nav.speed;
+          } else if (bd > 1e-3) {
+            vx = bx / bd; vz = bz / bd;
+            speed = ENEMY.chaseSpeed;
+            e.rotation.y = Math.atan2(bx, bz);
+          }
+        }
+      } else if (isPlanter) {
+        // ---- CARRY THE BOMB TO A SITE, THEN PLANT IT (hold 3s) ----
+        state = 'plant';
+        const zone = zoneAt(p.x, p.y, p.z);
+        if (zone) {
+          e.userData.plantProg = (e.userData.plantProg || 0) + dt;
+          if (e.userData.plantProg >= 3) {
+            e.userData.plantProg = 0;
+            plantBomb(p.x, p.y - CAPSULE_HALF, p.z, zone.site);
+            state = 'patrol';
+          }
+        } else {
+          e.userData.plantProg = 0;
+          const nav = navRoute(e, p, ENEMY.chaseSpeed, now);
+          if (nav.done) {
+            // route finished but not in a zone -> walk at the site center
+            const site = e.userData.targetSite || 'A';
+            const zn = PLANT_ZONES.find(z => z.site === site) || PLANT_ZONES[0];
+            const tx = (zn.x1 + zn.x2) / 2;
+            const tz = (zn.z1 + zn.z2) / 2;
+            const sdx = tx - p.x, sdz = tz - p.z;
+            const sd = Math.hypot(sdx, sdz);
+            if (sd > 1) {
+              vx = sdx / sd; vz = sdz / sd;
+              speed = ENEMY.chaseSpeed;
+              e.rotation.y = Math.atan2(sdx, sdz);
+            }
+          } else {
+            vx = nav.vx; vz = nav.vz; speed = nav.speed;
+          }
         }
       } else if (dist < ENEMY.chaseRange && sameHeight) {
         // ---- CHASE: move at the player + strafe side to side ----
@@ -1479,9 +2008,10 @@ async function boot() {
     tickRounds(now);
 
     if (controls.isLocked) updateMovement(dt);
-    if (!buyMenuOpen && ROUND.state === 'active') updateEnemies(now);
+    if (!buyMenuOpen && ROUND.state === 'active') updateEnemies(now, dt);
     updateTracers(dt);
     world.step();
+    updateGrenades(dt, now);
 
     for (const e of enemies) {
       const ep = e.userData.body.translation();
@@ -1494,6 +2024,81 @@ async function boot() {
       p.y - CAPSULE_HALF + PLAYER.eyeHeight,
       p.z
     );
+
+    // ---- bomb: 40s timer + blinking C4 light ----
+    if (bomb.planted && ROUND.state === 'active' && now - bomb.plantedAt >= BOMB_TIMER) {
+      endRound(playerTeam === 'T');   // bomb explodes -> terrorists win
+    }
+    if (bomb.planted) {
+      updateBombHUD();
+      const left = BOMB_TIMER - (now - bomb.plantedAt);
+      const iv = left < 10000 ? 150 : 400;   // panic blink in the last 10s
+      c4Mesh.userData.light.material.color.setHex(
+        Math.floor(now / iv) % 2 ? 0xff2020 : 0x440000
+      );
+    }
+
+    // ---- bomb: hold E to plant / defuse (with HUD progress bar) ----
+    let barText = '';
+    let barPct = 0;
+    if (ROUND.state === 'active') {
+      const feet = p.y - CAPSULE_HALF;
+      const zone = zoneAt(p.x, p.y, p.z);
+      const nearBomb = bomb.planted &&
+        Math.hypot(p.x - bomb.x, p.z - bomb.z) < 40 &&
+        Math.abs(feet - bomb.y) < 40;
+      const eHeld = keys.has('KeyE');
+
+      if (playerTeam === 'T' && !bomb.planted && zone) {
+        barText = eHeld ? 'PLANTING BOMB…' : 'HOLD [E] TO PLANT';
+        if (eHeld) {
+          plantProgress += dt * 1000;
+          if (plantProgress >= PLANT_TIME) {
+            plantProgress = 0;
+            playerMoney += 300;   // +$300 for planting
+            updateAmmoHUD();
+            plantBomb(p.x, feet, p.z, zone.site);
+          }
+        } else {
+          plantProgress = 0;
+        }
+        barPct = Math.min(1, plantProgress / PLANT_TIME);
+      } else if (playerTeam === 'CT' && nearBomb) {
+        barText = eHeld ? 'DEFUSING BOMB…' : 'HOLD [E] TO DEFUSE';
+        if (eHeld) {
+          defuseProgress += dt * 1000;
+          if (defuseProgress >= DEFUSE_TIME) {
+            defuseProgress = 0;
+            playerMoney += 300;   // +$300 for defusing
+            updateAmmoHUD();
+            endRound(true);       // CT defused -> counter-terrorists win
+          }
+        } else {
+          defuseProgress = 0;
+        }
+        barPct = Math.min(1, defuseProgress / DEFUSE_TIME);
+      } else {
+        plantProgress = 0;
+        defuseProgress = 0;
+      }
+    } else {
+      plantProgress = 0;
+      defuseProgress = 0;
+    }
+    if (barText) {
+      bombBarEl.style.display = 'block';
+      bombBarLabelEl.textContent = barText;
+      bombBarFillEl.style.width = (barPct * 100).toFixed(1) + '%';
+    } else {
+      bombBarEl.style.display = 'none';
+    }
+
+    // ---- flashbang white overlay (fades over 3s) ----
+    if (now < flashOverlayUntil) {
+      flashOverlayEl.style.opacity = String((flashOverlayUntil - now) / 3000);
+    } else {
+      flashOverlayEl.style.opacity = '0';
+    }
 
     const hSpeed = Math.hypot(vel.x, vel.z);
     speedEl.textContent = hSpeed.toFixed(0);
