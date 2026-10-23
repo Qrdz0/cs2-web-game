@@ -1,20 +1,24 @@
-// cs2-web-game — Phase 5: Round System, Enemy Gunplay, Gun Viewmodels, Map Atmosphere
+// cs2-web-game — Phase 1: Mirage Map, Team Select, AI Fix
 // Three.js (rendering) + Rapier (collisions) via CDN importmap.
 //
-// Physics model (unchanged from Phase 4):
+// Physics model (unchanged):
 //   - floor / walls / crates / ramps : FIXED rigid bodies (one per mesh)
 //   - player                         : DYNAMIC capsule, rotations locked, CCD
 //   - gravity                        : Rapier applies it (sv_gravity 800)
-//   - ground detection               : 0.3u downward ray from below the feet
+//   - ground detection               : downward ray from the capsule
 //   - movement                       : Source friction/accelerate on ground,
 //                                      exact Quake/Source air-accelerate in air
 //
-// Phase 5 (this file):
-//   - composite gun viewmodels (pistol / SMG / deagle) built from primitives
-//   - enemy AI: strafe while chasing, LOS-gated shooting with tracers + spread
-//   - player HP, red damage flash, directional damage indicator
-//   - CS2-style round state machine: Warmup -> Active -> Round Over -> ...
-//   - skybox sphere + fog + shadowed sun for a real map atmosphere
+// Phase 1 (this file):
+//   - team select screen: Join T / Join CT before pointer lock
+//   - de_mirage-style blockout: T Spawn, Mid + Xbox, A Site (ramp,
+//     Palace, Tetris), B Site (van + apartments), CT Spawn
+//   - enemy shots now start a few units IN FRONT of the enemy body and
+//     are tested against the player capsule -> no more grazing misses
+//   - visible fast red tracer bolts for enemy fire
+//   - desert atmosphere: sky-blue background, fog, shadowed sun
+//
+// Run:  npx serve -l 8000 .   ->  http://localhost:8000
 
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
@@ -65,23 +69,25 @@ const ENEMY = {
   strafeSpeed: 70,
   chaseRange: 500,
   shootRange: 420,
-  chaseYRange: 60,
+  chaseYRange: 100,   // platform <-> ground players can still fight
   damage: 12,
   tracerSpeed: 1600,
 };
 
 // ================================================================
-// ECONOMY + ROUND STATE
+// TEAMS + ROUND STATE
 // ================================================================
+let playerTeam = null;    // 'T' | 'CT'  (set from the team select screen)
+
 let playerMoney = 800;
 let playerHP = PLAYER.maxHP;
 
 const ROUND = {
-  state: 'warmup',      // 'warmup' | 'active' | 'roundover'
+  state: 'menu',          // 'menu' | 'warmup' | 'active' | 'roundover'
   number: 0,
   perRound: 5,
-  stateAt: 0,           // timestamp of last state change
-  nextAt: 0,            // when roundover -> next round
+  stateAt: 0,             // timestamp of last state change
+  nextAt: 0,              // when roundover -> next round
 };
 
 // ================================================================
@@ -160,12 +166,13 @@ async function boot() {
   await RAPIER.init();
 
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x8fb4d9);
-  scene.fog = new THREE.Fog(0xb9c4cc, 900, 2400);   // tactical haze
+  scene.background = new THREE.Color(0x87ceeb);        // bright desert sky
+  scene.fog = new THREE.Fog(0xc7c0b0, 700, 2500);      // dusty haze
 
   const camera = new THREE.PerspectiveCamera(
     90, window.innerWidth / window.innerHeight, 0.1, 3000
   );
+  camera.rotation.order = 'YXZ';
   scene.add(camera);   // required so camera children (gun viewmodel) render
 
   const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -175,37 +182,17 @@ async function boot() {
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   document.body.appendChild(renderer.domElement);
 
-  // ---------------- skybox (big gradient sphere, no fog on it) --------
-  {
-    const c = document.createElement('canvas');
-    c.width = 4; c.height = 256;
-    const g = c.getContext('2d');
-    const grad = g.createLinearGradient(0, 0, 0, 256);
-    grad.addColorStop(0.0, '#3d6fa8');    // zenith blue
-    grad.addColorStop(0.45, '#8fb4d9');
-    grad.addColorStop(0.62, '#d8c9a8');   // dusty horizon
-    grad.addColorStop(1.0, '#c8b487');    // sandy ground haze
-    g.fillStyle = grad;
-    g.fillRect(0, 0, 4, 256);
-    const skyTex = new THREE.CanvasTexture(c);
-    skyTex.colorSpace = THREE.SRGBColorSpace;
-    const sky = new THREE.Mesh(
-      new THREE.SphereGeometry(2800, 24, 16),
-      new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, fog: false })
-    );
-    scene.add(sky);
-  }
-
-  // ---------------- lighting (low ambient + strong shadowed sun) ------
-  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-  const sun = new THREE.DirectionalLight(0xfff4e0, 2.0);
-  sun.position.set(500, 800, 300);
+  // ---------------- lighting (desert sun + soft fill) ----------------
+  scene.add(new THREE.AmbientLight(0xffffff, 0.45));
+  const sun = new THREE.DirectionalLight(0xfff1d6, 2.2);
+  sun.position.set(600, 900, 400);
   sun.castShadow = true;
   sun.shadow.mapSize.set(2048, 2048);
-  const S = 650;
+  const S = 800;
   sun.shadow.camera.left = -S; sun.shadow.camera.right = S;
   sun.shadow.camera.top = S; sun.shadow.camera.bottom = -S;
-  sun.shadow.camera.far = 2500;
+  sun.shadow.camera.far = 3000;
+  sun.shadow.bias = -0.0006;
   scene.add(sun);
 
   // ---------------- physics world ----------------
@@ -214,17 +201,18 @@ async function boot() {
   // everything a bullet can hit (floor, walls, crates, ramp, enemies)
   const shootables = [];
 
-  // ---------------- materials & textures ----------------
+  // ---------------- materials (all map = MeshLambertMaterial) ---------
   const concreteTex = makeConcreteTexture();
   concreteTex.repeat.set(9, 10);
   const midTex = makeConcreteTexture();
   midTex.repeat.set(2, 2);
-  const floorMat = new THREE.MeshStandardMaterial({ map: concreteTex, roughness: 1 });
-  const midMat = new THREE.MeshStandardMaterial({ map: midTex, roughness: 1 });
-  const wallMat = new THREE.MeshStandardMaterial({ map: makeSandTexture(), roughness: 0.95 });
-  const crateMat = new THREE.MeshStandardMaterial({ map: makeWoodTexture(), roughness: 0.85 });
+  const floorMat = new THREE.MeshLambertMaterial({ map: concreteTex });
+  const midMat = new THREE.MeshLambertMaterial({ map: midTex, color: 0x9aa0a6 });
+  const wallMat = new THREE.MeshLambertMaterial({ map: makeSandTexture() });
+  const crateMat = new THREE.MeshLambertMaterial({ map: makeWoodTexture() });
+  const paintMat = c => new THREE.MeshLambertMaterial({ color: c });
 
-  // ---------------- map helpers (every mesh gets a FIXED collider) -----
+  // ---------------- map helpers (every BOX/RAMP gets a FIXED collider) -
   const BOX = (x, y, z, w, h, d, type = 'wall') => {
     const mat =
       type === 'crate'    ? crateMat :
@@ -242,16 +230,17 @@ async function boot() {
     return mesh;
   };
 
-  const RAMP = (x, y, z, w, h, d, rotX, type = 'concrete') => {
+  // ramp rises along +X (rotate around Z by a positive angle)
+  const RAMP = (x, y, z, w, h, d, rotZ, type = 'concrete') => {
     const mat = type === 'concrete' ? floorMat : wallMat;
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
     mesh.position.set(x, y, z);
-    mesh.rotation.x = rotX;
+    mesh.rotation.z = rotZ;
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     scene.add(mesh);
     shootables.push(mesh);
-    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(rotX, 0, 0));
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, rotZ));
     const body = world.createRigidBody(
       RAPIER.RigidBodyDesc.fixed()
         .setTranslation(x, y, z)
@@ -261,10 +250,19 @@ async function boot() {
     return mesh;
   };
 
+  // thin ground paint — VISUAL ONLY (no collider, never hit by bullets)
+  const PAINT = (x, y, z, w, d, color) => {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, 1, d), paintMat(color));
+    mesh.position.set(x, y, z);
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+    return mesh;
+  };
+
   const MARK = (x, y, z, w, d, color) => {
     const mesh = new THREE.Mesh(
       new THREE.BoxGeometry(w, 1, d),
-      new THREE.MeshStandardMaterial({ color, roughness: 1 })
+      new THREE.MeshLambertMaterial({ color })
     );
     mesh.position.set(x, y, z);
     mesh.receiveShadow = true;
@@ -273,69 +271,130 @@ async function boot() {
   };
 
   // ================================================================
-  // MAP BLOCKOUT — T Spawn -> Mid -> A Site   (x: -350..350, z: -400..400)
+  // MAP BLOCKOUT — de_mirage style
+  //   x: -420..420 (west..east)   z: -460..460 (CT..T)
+  //   T Spawn = south, CT Spawn = north, A = east, B = west, Mid = center
   // ================================================================
-  BOX(0, -2, 0, 700, 4, 800, 'concrete');
+  BOX(0, -2, 0, 840, 4, 920, 'concrete');        // ground
 
-  // ---- perimeter (height 128) ----
-  BOX(0, 64, -400, 716, 128, 16, 'wall');    // north
-  BOX(0, 64, 400, 716, 128, 16, 'wall');     // south
-  BOX(-350, 64, 0, 16, 128, 800, 'wall');    // west
-  BOX(350, 64, 0, 16, 128, 800, 'wall');     // east
+  // ---- perimeter (height 140) ----
+  BOX(0, 70, -452, 840, 140, 16, 'wall');       // north
+  BOX(0, 70, 452, 840, 140, 16, 'wall');        // south
+  BOX(-412, 70, 0, 16, 140, 920, 'wall');       // west
+  BOX(412, 70, 0, 16, 140, 920, 'wall');        // east
 
-  // ---- T Spawn (south, z 240..400) ----
-  BOX(-210, 48, 240, 280, 96, 16, 'wall');
-  BOX(125, 48, 240, 110, 96, 16, 'wall');
-  BOX(305, 48, 240, 90, 96, 16, 'wall');
-  BOX(-140, 48, 330, 16, 96, 140, 'wall');
-  BOX(140, 48, 330, 16, 96, 140, 'wall');
+  // ---- zone paint (visual only, staggered heights = no z-fighting) ----
+  PAINT(0, 0.50, 380, 840, 160, 0xd9b87c);      // T Spawn — sand
+  PAINT(0, 0.55, 210, 840, 180, 0xc7b48c);      // plaza — light sand
+  PAINT(250, 0.60, -90, 340, 440, 0xd2c09a);    // A Site — tan
+  PAINT(-250, 0.65, -90, 340, 440, 0xbfb9a6);   // B Site — dust grey
+  PAINT(0, 0.70, -90, 160, 440, 0x9aa0a6);      // Mid — grey concrete
+  PAINT(0, 0.75, -380, 840, 160, 0xa8adb3);     // CT Spawn — grey
 
-  // ---- Mid (grey concrete corridor) ----
-  BOX(-70, 48, 75, 16, 96, 330, 'mid');
-  BOX(70, 48, 75, 16, 96, 330, 'mid');
-  BOX(0, 20, 40, 64, 40, 16, 'mid');
-  BOX(-45, 20, 150, 48, 40, 16, 'mid');
+  // ---- T Spawn (south, z 300..444) ----
+  BOX(-265, 48, 300, 310, 96, 16, 'wall');      // front wall x -420..-110
+  BOX(265, 48, 300, 310, 96, 16, 'wall');       // front wall x 110..420
+  //   -> gap x -110..110 = the T exit into plaza/mid
+  BOX(-210, 48, 400, 16, 96, 80, 'wall');       // cover wall west
+  BOX(210, 48, 400, 16, 96, 80, 'wall');        // cover wall east
 
-  // ---- west area ----
-  BOX(-220, 48, -20, 16, 96, 160, 'wall');
+  // ---- CT Spawn (north, z -444..-300) ----
+  BOX(-350, 48, -300, 140, 96, 16, 'wall');     // x -420..-280
+  BOX(-130, 48, -300, 180, 96, 16, 'wall');     // x -220..-40
+  BOX(130, 48, -300, 180, 96, 16, 'wall');      // x 40..220
+  BOX(350, 48, -300, 140, 96, 16, 'wall');      // x 280..420
+  //   -> gaps: -280..-220 (to B), -40..40 (to Mid), 220..280 (to A)
+  BOX(-210, 48, -400, 16, 96, 80, 'wall');      // cover wall west
+  BOX(210, 48, -400, 16, 96, 80, 'wall');       // cover wall east
 
-  // ---- A Site (north-east platform) ----
-  BOX(215, 32, -310, 250, 64, 160, 'concrete');
-  RAMP(175, 21, -165, 130, 24, 154, 0.4289, 'concrete');
-  RAMP(305, 21, -165, 70, 24, 154, 0.4289, 'concrete');
-  BOX(215, 80, -382, 240, 32, 16, 'crate');
-  BOX(70, 32, -150, 64, 64, 64, 'crate');
+  // ---- Mid (grey concrete corridor, x -72..72) ----
+  BOX(80, 48, -240, 16, 96, 120, 'mid');        // east wall z -300..-180
+  BOX(80, 48, 30, 16, 96, 180, 'mid');          // east wall z -60..120
+  BOX(-80, 48, -240, 16, 96, 120, 'mid');       // west wall z -300..-180
+  BOX(-80, 48, 30, 16, 96, 180, 'mid');         // west wall z -60..120
+  //   -> gaps z -180..-60 lead to A (east) and B (west)
+  BOX(0, 24, -40, 72, 48, 96, 'mid');           // "Xbox" — jump on top
 
-  // ---- wooden crates ----
-  BOX(-200, 32, 300, 64, 64, 64, 'crate');
-  BOX(-200, 96, 300, 64, 64, 64, 'crate');
-  BOX(200, 32, 320, 64, 64, 64, 'crate');
-  BOX(300, 32, 100, 64, 64, 64, 'crate');
-  BOX(-100, 32, -160, 64, 64, 64, 'crate');
-  BOX(150, 96, -320, 64, 64, 64, 'crate');
-  BOX(214, 96, -320, 64, 64, 64, 'crate');
-  BOX(150, 160, -320, 64, 64, 64, 'crate');
+  // ---- A Site (east): raised platform + ramp + Palace + Tetris ----
+  BOX(322, 32, -180, 164, 64, 240, 'concrete'); // platform x 240..404, top y=64
+  // ramp: ground y=0 at x~110 -> platform y=64 at x=240 (~26 deg)
+  RAMP(178.5, 24.8, -180, 145, 16, 140, 0.4595, 'concrete');
+
+  // Palace (room sitting on the platform, doorway in its south wall)
+  BOX(352, 112, -292, 104, 96, 16, 'wall');     // palace north
+  BOX(300, 112, -240, 16, 96, 120, 'wall');     // palace west
+  BOX(320, 112, -180, 40, 96, 16, 'wall');      // palace south x 300..340
+  BOX(392, 112, -180, 24, 96, 16, 'wall');      // palace south x 380..404
+  //   -> doorway x 340..380
+
+  // Tetris (stacked crates on the platform, near the ramp top)
+  BOX(340, 80, -90, 48, 32, 48, 'crate');
+  BOX(380, 80, -90, 48, 32, 48, 'crate');
+  BOX(380, 112, -90, 48, 32, 48, 'crate');
+
+  // ---- B Site (west): van + apartment building + crates ----
+  BOX(-300, 20, -140, 150, 40, 70, 'mid');      // van body (top y=40)
+  BOX(-385, 25, -140, 30, 50, 70, 'mid');       // van cab  (top y=50)
+
+  // apartment building (big box, doorway in the south wall)
+  BOX(-332, 60, -292, 144, 120, 16, 'wall');    // north wall
+  BOX(-260, 60, -232, 16, 120, 128, 'wall');    // east wall (west = perimeter)
+  BOX(-384, 60, -164, 40, 120, 16, 'wall');     // south wall x -404..-364
+  BOX(-292, 60, -164, 64, 120, 16, 'wall');     // south wall x -324..-260
+  //   -> doorway x -364..-324
+
+  // B crates + plaza cover
+  BOX(-300, 32, -60, 64, 64, 64, 'crate');
+  BOX(-300, 96, -60, 64, 64, 64, 'crate');
+  BOX(-140, 32, -260, 64, 64, 64, 'crate');
+  BOX(140, 32, 200, 64, 64, 64, 'crate');
+  BOX(-150, 32, 180, 64, 64, 64, 'crate');
+  BOX(0, 32, 240, 64, 64, 64, 'crate');
 
   // ---- zone markers ----
-  MARK(0, 0.5, 320, 500, 130, 0x8a6f4a);
-  MARK(0, 0.5, 75, 120, 320, 0x565b62);
-  MARK(215, 64.5, -310, 180, 120, 0xa8324a);
+  MARK(322, 64.6, -180, 140, 200, 0xa8324a);    // A site (on platform)
+  MARK(-300, 0.8, -60, 200, 160, 0x4a7fc0);     // B site
 
   // ================================================================
-  // ENEMY SPAWN POINTS (round respawns cycle through these)
-  // wps = patrol waypoints for that area
+  // SPAWN POINTS
+  //   TEAM_SPAWNS  — where the player spawns per chosen team
+  //   ENEMY_SPAWNS — keyed by PLAYER team: enemies always spawn on the
+  //                   opposite side (T player -> enemies north/CT side)
+  //   wps = patrol waypoints [x, z] for that area
   // ================================================================
-  const ENEMY_SPAWNS = [
-    { x: 0,   y: 36,  z: -40,  wps: [[-45, 140], [45, 60], [0, -55], [-45, -55]] },        // Mid
-    { x: -290, y: 36, z: 330,  wps: [[-320, 360], [-260, 360], [-260, 270], [-320, 270]] },// T Spawn
-    { x: -260, y: 36, z: 140,  wps: [[-290, 90], [-150, 90], [-150, 200], [-290, 200]] },  // West yard
-    { x: 270,  y: 100, z: -300, wps: [[100, -260], [300, -260], [300, -345], [100, -345]] },// A Site
-    { x: 240,  y: 36, z: 140,  wps: [[150, 60], [150, 200], [240, 200], [240, 60]] },      // A-short
-    { x: -40,  y: 36, z: 190,  wps: [[-60, 120], [50, 120], [50, 210], [-60, 210]] },      // Mid-south
-    { x: 180,  y: 36, z: -120, wps: [[120, -100], [260, -100], [260, -180], [120, -180]] },// A ramp base
-    { x: -300, y: 36, z: -300, wps: [[-320, -240], [-150, -240], [-150, -350], [-320, -350]] }, // NW yard
-  ];
+  const TEAM_SPAWNS = {
+    T:  { x: 0, y: 0, z: 400,  yaw: 0 },          // faces north (-Z)
+    CT: { x: 0, y: 0, z: -400, yaw: Math.PI },    // faces south (+Z)
+  };
 
+  const ENEMY_SPAWNS = {
+    // player picked T -> enemies (CTs) hold the north half
+    T: [
+      { x: -150, y: 36,  z: -390, wps: [[-190, -430], [-50, -430], [-50, -330], [-190, -330]] }, // CT spawn W
+      { x: 150,  y: 36,  z: -390, wps: [[60, -430], [190, -430], [190, -340], [60, -340]] },     // CT spawn E
+      { x: 170,  y: 36,  z: -60,  wps: [[120, -30], [230, -30], [230, -80], [120, -80]] },       // A site ground
+      { x: 270,  y: 100, z: -200, wps: [[270, -270], [270, -190], [265, -100], [295, -100]] },    // A platform (top y=64)
+      { x: -170, y: 36,  z: -70,  wps: [[-130, -30], [-210, -30], [-210, -90], [-130, -90]] },    // B site
+      { x: -340, y: 36,  z: -230, wps: [[-390, -280], [-275, -280], [-275, -180], [-390, -180]] },// B apartments
+      { x: 0,    y: 36,  z: -240, wps: [[-40, -270], [40, -270], [40, -160], [-40, -160]] },      // Mid north
+      { x: 0,    y: 36,  z: 60,   wps: [[-40, 20], [40, 20], [40, 100], [-40, 100]] },            // Mid south
+    ],
+    // player picked CT -> enemies (Ts) hold the south half
+    CT: [
+      { x: -120, y: 36, z: 400, wps: [[-190, 430], [-50, 430], [-50, 330], [-190, 330]] },        // T spawn W
+      { x: 120,  y: 36, z: 400, wps: [[50, 330], [190, 330], [190, 430], [50, 430]] },            // T spawn E
+      { x: 170,  y: 36, z: 60,  wps: [[120, 30], [230, 30], [230, 90], [120, 90]] },              // A site south
+      { x: 300,  y: 36, z: -40, wps: [[260, -40], [380, -40], [380, 10], [260, 10]] },            // A site mid
+      { x: -170, y: 36, z: 40,  wps: [[-130, 20], [-210, 20], [-210, 90], [-130, 90]] },          // B site south
+      { x: -340, y: 36, z: 200, wps: [[-390, 150], [-275, 150], [-275, 250], [-390, 250]] },      // plaza west
+      { x: 0,    y: 36, z: 160, wps: [[-50, 140], [50, 140], [50, 260], [-50, 260]] },            // plaza mid
+      { x: 0,    y: 36, z: 60,  wps: [[-40, 20], [40, 20], [40, 100], [-40, 100]] },              // Mid south
+    ],
+  };
+
+  // ================================================================
+  // ENEMIES
+  // ================================================================
   const enemies = [];
   const tracers = [];
 
@@ -349,12 +408,12 @@ async function boot() {
     enemies.push(mesh);
     shootables.push(mesh);
 
-    // little gun hint on the front so they read as shooters
+    // little gun hint on the front (local +Z faces the player)
     const gunHint = new THREE.Mesh(
       new THREE.BoxGeometry(2, 2, 8),
       new THREE.MeshStandardMaterial({ color: 0x1a1d22, roughness: 0.5, metalness: 0.6 })
     );
-    gunHint.position.set(6, -4, -16);
+    gunHint.position.set(6, -4, 16);
     mesh.add(gunHint);
 
     const body = world.createRigidBody(
@@ -402,8 +461,8 @@ async function boot() {
 
   function spawnRoundEnemies() {
     clearEnemies();
+    const pts = (ENEMY_SPAWNS[playerTeam] || ENEMY_SPAWNS.T).slice();
     // shuffle spawn points, take 5
-    const pts = ENEMY_SPAWNS.slice();
     for (let i = pts.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [pts[i], pts[j]] = [pts[j], pts[i]];
@@ -415,14 +474,13 @@ async function boot() {
   }
 
   // ================================================================
-  // player — DYNAMIC capsule (T Spawn)
+  // player — DYNAMIC capsule (spawned at the chosen team's spawn)
   // ================================================================
   const CAPSULE_HALF = PLAYER.halfHeight + PLAYER.radius; // 36 = center -> feet
   const SPAWN_Y = CAPSULE_HALF + 5;
-  const SPAWN = { x: 0, y: SPAWN_Y, z: 350 };
   const playerBody = world.createRigidBody(
     RAPIER.RigidBodyDesc.dynamic()
-      .setTranslation(SPAWN.x, SPAWN.y, SPAWN.z)
+      .setTranslation(TEAM_SPAWNS.T.x, SPAWN_Y, TEAM_SPAWNS.T.z)
       .setCcdEnabled(true)
   );
   playerBody.lockRotations(true);
@@ -555,6 +613,7 @@ async function boot() {
   const bannerEl = document.getElementById('roundBanner');
   const damageFlashEl = document.getElementById('damageFlash');
   const dmgIndicatorsEl = document.getElementById('dmgIndicators');
+  const teamLabelEl = document.getElementById('teamLabel');
 
   function updateAmmoHUD() {
     const w = WEAPONS[weaponIndex];
@@ -699,14 +758,16 @@ async function boot() {
   }
 
   function respawnPlayer() {
-    playerBody.setTranslation({ x: SPAWN.x, y: SPAWN.y, z: SPAWN.z }, true);
+    const s = TEAM_SPAWNS[playerTeam] || TEAM_SPAWNS.T;
+    playerBody.setTranslation({ x: s.x, y: SPAWN_Y, z: s.z }, true);
     playerBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    camera.rotation.y = s.yaw;   // face the enemy side
     playerHP = PLAYER.maxHP;
     updateHPHUD();
   }
 
   // ================================================================
-  // ROUND SYSTEM — Warmup -> Active -> Round Over (3s) -> next
+  // ROUND SYSTEM — (menu) -> Warmup -> Active -> Round Over -> next
   // ================================================================
   function endRound(won) {
     if (ROUND.state !== 'active') return;
@@ -751,6 +812,7 @@ async function boot() {
 
   // round state machine tick (called every frame)
   function tickRounds(now) {
+    if (ROUND.state === 'menu') return;   // no rounds until a team is picked
     if (ROUND.state === 'warmup' && now >= ROUND.nextAt) {
       startRound(1);
     } else if (ROUND.state === 'roundover' && now >= ROUND.nextAt) {
@@ -841,17 +903,56 @@ async function boot() {
   });
 
   // ================================================================
-  // per-frame player state (movement — unchanged from Phase 1-4)
+  // per-frame player state (movement — unchanged)
   // ================================================================
   const vel = new THREE.Vector3();
   let isGrounded = false;
   let jumpQueued = false;
 
   const overlay = document.getElementById('overlay');
+  const loadingEl = document.getElementById('loading');
+  const teamSelectEl = document.getElementById('teamSelect');
+  const resumeEl = document.getElementById('resume');
   const settingsBtn = document.getElementById('settingsBtn');
   const settingsModal = document.getElementById('settingsModal');
 
-  overlay.addEventListener('click', () => controls.lock());
+  // ---------------- TEAM SELECT ----------------
+  function joinTeam(team) {
+    if (playerTeam) return;
+    playerTeam = team;
+
+    // spawn at the chosen team's spawn, facing the enemy side
+    const s = TEAM_SPAWNS[team];
+    playerBody.setTranslation({ x: s.x, y: SPAWN_Y, z: s.z }, true);
+    playerBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    camera.rotation.y = s.yaw;
+
+    // HUD team label
+    teamLabelEl.textContent = team;
+    teamLabelEl.className = 'val ' + team.toLowerCase();
+
+    teamSelectEl.style.display = 'none';
+    resumeEl.style.display = 'block';
+
+    startWarmup();          // round machine begins AFTER a team is chosen
+    controls.lock();        // click on the button = user gesture -> allowed
+  }
+
+  document.getElementById('joinT').addEventListener('click', e => {
+    e.stopPropagation();
+    joinTeam('T');
+  });
+  document.getElementById('joinCT').addEventListener('click', e => {
+    e.stopPropagation();
+    joinTeam('CT');
+  });
+
+  // clicking the overlay resumes only once a team is chosen
+  overlay.addEventListener('click', () => {
+    if (!playerTeam) return;
+    controls.lock();
+  });
+
   controls.addEventListener('lock', () => {
     overlay.style.display = 'none';
     settingsBtn.style.display = 'none';
@@ -865,6 +966,9 @@ async function boot() {
   controls.addEventListener('unlock', () => {
     overlay.style.display = 'flex';
     settingsBtn.style.display = 'flex';
+    loadingEl.style.display = 'none';
+    teamSelectEl.style.display = playerTeam ? 'none' : 'block';
+    resumeEl.style.display = playerTeam ? 'block' : 'none';
     document.getElementById('crosshair').style.display = 'none';
     document.getElementById('hud').style.display = 'none';
     document.getElementById('roundHud').style.display = 'none';
@@ -934,7 +1038,7 @@ async function boot() {
   });
 
   // ================================================================
-  // GROUND CHECK
+  // GROUND CHECK — long enough to catch the ~26 deg A ramp
   // ================================================================
   function checkGrounded() {
     const p = playerBody.translation();
@@ -943,7 +1047,7 @@ async function boot() {
       { x: p.x, y: feet - 0.1, z: p.z },
       { x: 0, y: -1, z: 0 }
     );
-    const hit = world.castRay(ray, 0.3, true);
+    const hit = world.castRay(ray, 3, true);
     return Boolean(hit);
   }
 
@@ -968,54 +1072,89 @@ async function boot() {
   }
 
   // ================================================================
-  // ENEMY TRACERS — visible fast-moving bolts with spread
+  // ENEMY SHOTS — origin starts IN FRONT of the enemy body, hit test
+  // is ray-vs-player-capsule (no more grazing misses), visible fast
+  // red tracer bolt.
   // ================================================================
-  const tracerGeo = new THREE.SphereGeometry(1.6, 6, 6);
-  const tracerMat = new THREE.MeshBasicMaterial({ color: 0xffee88 });
+  const boltGeo = new THREE.BoxGeometry(1.4, 1.4, 26);
+  const boltMat = new THREE.MeshBasicMaterial({ color: 0xff2b2b });
+  const BOLT_AXIS = new THREE.Vector3(0, 0, 1);
+  const _pt = new THREE.Vector3();
+  const _tmp = new THREE.Vector3();
+  const _closest = new THREE.Vector3();
 
-  function fireEnemyTracer(fromPos) {
+  // does a ray pass through the player's capsule (axis +/- halfHeight, r=16)?
+  function rayHitsPlayer(origin, dir) {
     const pp = playerBody.translation();
-    const target = new THREE.Vector3(
+    const top = pp.y + PLAYER.halfHeight;
+    const bottom = pp.y - PLAYER.halfHeight;
+    let best = Infinity;
+    for (let i = 0; i <= 4; i++) {
+      _pt.set(pp.x, bottom + (top - bottom) * (i / 4), pp.z);
+      const t = Math.max(0, _tmp.copy(_pt).sub(origin).dot(dir));
+      _closest.copy(origin).addScaledVector(dir, t);
+      const d = _closest.distanceTo(_pt);
+      if (d < best) best = d;
+    }
+    return best <= PLAYER.radius + 3;
+  }
+
+  function fireEnemyShot(enemyPos) {
+    const pp = playerBody.translation();
+    const eye = new THREE.Vector3(
       pp.x,
-      pp.y - CAPSULE_HALF + PLAYER.eyeHeight - 4,   // aim at chest
+      pp.y - CAPSULE_HALF + PLAYER.eyeHeight,
       pp.z
     );
-    // random spread — grows with distance so far shots miss more
-    const dist = target.distanceTo(fromPos);
-    const spread = 5 + dist * 0.028;
-    target.x += (Math.random() * 2 - 1) * spread;
-    target.y += (Math.random() * 2 - 1) * spread * 0.6;
-    target.z += (Math.random() * 2 - 1) * spread;
+    const chest = new THREE.Vector3(enemyPos.x, enemyPos.y + 20, enemyPos.z);
+    const dist = chest.distanceTo(eye);
+    if (dist < 1) return;
+    const toEye = eye.clone().sub(chest).divideScalar(dist);
 
-    const dir = target.clone().sub(fromPos).normalize();
-    const mesh = new THREE.Mesh(tracerGeo, tracerMat);
-    mesh.position.copy(fromPos);
+    // start a few units in FRONT of the body so the ray never hits
+    // the shooter's own capsule
+    const start = chest.clone().addScaledVector(toEye, Math.min(24, dist * 0.4));
+
+    // aim at the player's camera with distance-scaled spread
+    const aim = eye.clone();
+    const spread = 4 + dist * 0.018;
+    aim.x += (Math.random() * 2 - 1) * spread;
+    aim.y += (Math.random() * 2 - 1) * spread * 0.7;
+    aim.z += (Math.random() * 2 - 1) * spread;
+
+    const dir = aim.sub(start);
+    const travel = dir.length();
+    dir.normalize();
+
+    // decide the hit NOW against the capsule — the bolt is just the visual
+    const willHit = rayHitsPlayer(start, dir);
+
+    const mesh = new THREE.Mesh(boltGeo, boltMat);
+    mesh.position.copy(start);
+    mesh.quaternion.setFromUnitVectors(BOLT_AXIS, dir);
     scene.add(mesh);
     tracers.push({
       mesh,
       dir,
       speed: ENEMY.tracerSpeed,
       traveled: 0,
-      maxDist: dist + 40,
+      hitAt: travel,
+      maxDist: willHit ? travel : travel + 60,
+      willHit,
       damage: ENEMY.damage,
-      origin: fromPos.clone(),
+      origin: chest.clone(),
     });
     playShotSound(0.18);
   }
 
   function updateTracers(dt) {
-    const pp = playerBody.translation();
-    const playerCenter = new THREE.Vector3(pp.x, pp.y, pp.z);
-
     for (let i = tracers.length - 1; i >= 0; i--) {
       const t = tracers[i];
       const step = t.speed * dt;
       t.mesh.position.addScaledVector(t.dir, step);
       t.traveled += step;
 
-      // did it pass near the player? (capsule-ish check)
-      const d = t.mesh.position.distanceTo(playerCenter);
-      if (d < 24) {
+      if (t.willHit && t.traveled >= t.hitAt) {
         damagePlayer(t.damage, t.origin);
         scene.remove(t.mesh);
         tracers.splice(i, 1);
@@ -1032,7 +1171,7 @@ async function boot() {
   // ENEMY AI
   //   patrol — walk waypoints
   //   chase  — move at the player with random A/D strafing
-  //   attack — in LOS + range: stop, face the player, fire tracers
+  //   attack — in LOS + range: stop, face the player, fire red bolts
   // ================================================================
   function updateEnemies(now) {
     const pp = playerBody.translation();
@@ -1061,7 +1200,7 @@ async function boot() {
 
         if (now >= e.userData.nextShotAt) {
           e.userData.nextShotAt = now + 900 + Math.random() * 700;
-          fireEnemyTracer(p);
+          fireEnemyShot(p);
         }
       } else if (dist < ENEMY.chaseRange && sameHeight) {
         // ---- CHASE: move at the player + strafe side to side ----
@@ -1301,9 +1440,9 @@ async function boot() {
     renderer.setSize(window.innerWidth, window.innerHeight);
   });
 
-  startWarmup();
-  document.getElementById('loading').style.display = 'none';
-  document.getElementById('play').style.display = 'block';
+  // engine ready -> show the team select screen (rounds wait in 'menu')
+  loadingEl.style.display = 'none';
+  teamSelectEl.style.display = 'block';
   frame();
 }
 
@@ -1388,3 +1527,5 @@ function makeWoodTexture() {
 }
 
 boot().catch(e => fatal(e.stack || String(e)));
+
+
